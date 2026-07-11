@@ -87,6 +87,11 @@ int main() {
     r = js_eval(h, "typeof fetch + ',' + typeof setTimeout + ',' + typeof read");
     check(contains(r, "undefined,undefined,undefined"), "no fetch/setTimeout/read builtins");
 
+    // A NUL byte is a legal JS source character (here, inside a string
+    // literal); the length-aware bridge must not truncate the script at it.
+    r = js_eval(h, std::string("'a\0b'.length", 12));
+    check(contains(r, "\"result\":\"3\""), "source with embedded NUL is not truncated");
+
     // --- interrupt: infinite loop -----------------------------------------
     // Exactly what the Go host's Interrupter.Fire() does, in the same order:
     // the "host asked" flag first, then the bit that trips SpiderMonkey's poll.

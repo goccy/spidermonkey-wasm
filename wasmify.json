@@ -113,7 +113,7 @@
   },
   "phases": {
     "gen-proto": {
-      "completed_at": "2026-07-10T14:35:10Z",
+      "completed_at": "2026-07-11T10:48:06Z",
       "upstream_commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
       "output_files": [
         "proto/spidermonkey.proto",
@@ -123,7 +123,7 @@
       ]
     },
     "parse-headers": {
-      "completed_at": "2026-07-10T14:35:10Z",
+      "completed_at": "2026-07-11T10:48:06Z",
       "upstream_commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
       "output_files": [
         "api-spec.json"
