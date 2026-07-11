@@ -41,9 +41,15 @@ jobs:
           cargo install cbindgen --locked
 
       - name: Install wasmtime
+        # Pinned release download: wasmtime.dev/install.sh resolves "latest"
+        # through the GitHub API, which rate-limits anonymous CI runners and
+        # then installs nothing while still exiting 0.
         run: |
-          curl -fL --proto '=https' --tlsv1.2 https://wasmtime.dev/install.sh -sSf | bash
-          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+          curl -fL --proto '=https' --tlsv1.2 -o /tmp/wasmtime.tar.xz \
+            https://github.com/bytecodealliance/wasmtime/releases/download/v27.0.0/wasmtime-v27.0.0-x86_64-linux.tar.xz
+          tar -xf /tmp/wasmtime.tar.xz -C /tmp
+          sudo install /tmp/wasmtime-v27.0.0-x86_64-linux/wasmtime /usr/local/bin/wasmtime
+          wasmtime --version
 
       - name: Build engine with Intl
         run: bash scripts/build-engine-intl.sh
