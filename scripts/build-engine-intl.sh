@@ -126,7 +126,9 @@ SM_OBJ_FILES=(
 
 rm -rf "$PKG"
 mkdir -p "$PKG"
-cp -R "$OBJ/dist/include" "$PKG/include"
+# -L: dist/include is a tree of symlinks into the objdir; the archive needs
+# the real files.
+cp -RL "$OBJ/dist/include" "$PKG/include"
 # The generated config headers live in the objdir, not dist/include; every
 # consumer includes them (js-config.h via jstypes.h, js-confdefs.h via
 # -include), so they travel with the archive.
