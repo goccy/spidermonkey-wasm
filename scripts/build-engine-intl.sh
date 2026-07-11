@@ -78,6 +78,23 @@ grep -q 'get(cx)->wasiRecursionDepthLimit' "$f" || {
     exit 1
 }
 
+# gecko's ThinLTO setup adds ELF-linker plugin options that wasm-ld rejects
+# outright (-plugin-opt=-import-instr-limit, -plugin-opt=new-pass-manager,
+# -plugin-opt=-import-hot-multiplier). Only the js shell links in this build
+# — and the shell has to build, it is what drags jsrust into the graph — so
+# guard those flags off for WASI targets.
+f=$SRC/build/moz.configure/lto-pgo.configure
+perl -0pi -e 's/    elif c_compiler\.type == "clang":\n        ldflags\.append\("-Wl,-plugin-opt=-import-instr-limit=10"\)/    elif c_compiler.type == "clang" and target.os != "WASI":\n        ldflags.append("-Wl,-plugin-opt=-import-instr-limit=10")/' "$f"
+grep -q 'c_compiler.type == "clang" and target.os != "WASI"' "$f" || {
+    echo "error: wasm-ld plugin-opt patch (instr-limit) no longer applies to $f" >&2
+    exit 1
+}
+perl -0pi -e 's/        else:\n            if c_compiler\.version < "13\.0\.0":\n                ldflags\.append\("-Wl,-plugin-opt=new-pass-manager"\)\n            ldflags\.append\("-Wl,-plugin-opt=-import-hot-multiplier=30"\)/        elif target.os != "WASI":\n            if c_compiler.version < "13.0.0":\n                ldflags.append("-Wl,-plugin-opt=new-pass-manager")\n            ldflags.append("-Wl,-plugin-opt=-import-hot-multiplier=30")/' "$f"
+grep -q 'elif target.os != "WASI":' "$f" || {
+    echo "error: wasm-ld plugin-opt patch (hot-multiplier) no longer applies to $f" >&2
+    exit 1
+}
+
 # --- mozconfig -----------------------------------------------------------------
 # StarlingMonkey's release mozconfig, verbatim, with ONE change: no
 # --without-intl-api line, so the build defaults to --with-intl-api and
