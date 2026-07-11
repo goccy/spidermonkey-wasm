@@ -108,6 +108,24 @@ int main() {
         // ride along with Intl in current SpiderMonkey).
         r = js_eval(h, "typeof Temporal + ',' + typeof Intl.Segmenter");
         std::printf("     extras: %s\n", r.c_str());
+
+        // Temporal must WORK, not merely exist: date arithmetic exercises the
+        // calendar code, and resolving a named time zone exercises the ICU
+        // zoneinfo data compiled into the archive.
+        r = js_eval(h, "Temporal.PlainDate.from('2026-07-11').add({days: 30}).toString()");
+        check(contains(r, "2026-08-10"), "Temporal date arithmetic works");
+        r = js_eval(h,
+                    "Temporal.Instant.from('2026-07-11T00:00:00Z')"
+                    ".toZonedDateTimeISO('Asia/Tokyo').hour");
+        std::printf("     tz: %s\n", r.c_str());
+        check(contains(r, "\"result\":\"9\""), "Temporal named time zones resolve (ICU zoneinfo)");
+        r = js_eval(h, "new Intl.Segmenter('ja', {granularity: 'word'})"
+                       " && [...new Intl.Segmenter('ja', {granularity: 'word'})"
+                       ".segment('今日は良い天気')].length > 1 ? 'segmenter-ok' : 'no'");
+        check(contains(r, "segmenter-ok"), "Intl.Segmenter segments Japanese (ICU4X)");
+        // Probe only — upstream SpiderMonkey does not ship ShadowRealm either.
+        r = js_eval(h, "typeof ShadowRealm");
+        std::printf("     ShadowRealm: %s\n", r.c_str());
     }
 
     // --- interrupt: infinite loop -----------------------------------------
