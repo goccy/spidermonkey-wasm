@@ -84,9 +84,13 @@ grep -q 'get(cx)->wasiRecursionDepthLimit' "$f" || {
 # bundles ICU (data compiled in; wasi needs no filesystem for it).
 MOZCONFIG=$OBJ-mozconfig
 mkdir -p "$(dirname "$MOZCONFIG")"
+# Unlike StarlingMonkey's mozconfig, the js shell stays ENABLED: js/src/rust
+# (jsrust — encoding_rs, ICU4X capi, Temporal) is only in the build graph
+# behind `if not CONFIG["JS_DISABLE_SHELL"]` (js/src/moz.build), and a
+# with-intl engine cannot link without it. The shell binary itself is
+# discarded; it just drags jsrust into the build.
 cat > "$MOZCONFIG" <<EOF
 ac_add_options --enable-project=js
-ac_add_options --disable-js-shell
 ac_add_options --target=wasm32-unknown-wasi
 ac_add_options --without-system-zlib
 ac_add_options --disable-jit
@@ -126,11 +130,6 @@ mach_build() {
         python3 "$SRC/mach" --no-interactive build "$@"
 }
 mach_build
-# jsrust (encoding_rs + ICU4X capi + Temporal) is only demanded by the shell
-# link, and the shell is disabled; build the RustLibrary explicitly.
-# force-cargo-library-build is mach's per-directory target that actually runs
-# cargo for a RustLibrary (building the bare directory only exports headers).
-mach_build js/src/rust/force-cargo-library-build
 
 # --- package -------------------------------------------------------------------
 # libspidermonkey.a = libjs_static.a + the mozglue/mfbt/memory objects that are
