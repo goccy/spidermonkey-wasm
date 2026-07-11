@@ -101,6 +101,10 @@ grep -q 'elif target.os != "WASI":' "$f" || {
 # bundles ICU (data compiled in; wasi needs no filesystem for it).
 MOZCONFIG=$OBJ-mozconfig
 mkdir -p "$(dirname "$MOZCONFIG")"
+# Also unlike StarlingMonkey's, shared memory stays ENABLED: a single agent
+# with SharedArrayBuffer + non-blocking Atomics is spec-conformant without any
+# threads (Atomics.wait must throw on an agent whose [[CanBlock]] is false),
+# and it is the first stage toward goroutine-backed agents via wasi-threads.
 # Unlike StarlingMonkey's mozconfig, the js shell stays ENABLED: js/src/rust
 # (jsrust — encoding_rs, ICU4X capi, Temporal) is only in the build graph
 # behind `if not CONFIG["JS_DISABLE_SHELL"]` (js/src/moz.build), and a
@@ -112,7 +116,6 @@ ac_add_options --target=wasm32-unknown-wasi
 ac_add_options --without-system-zlib
 ac_add_options --disable-jit
 ac_add_options --disable-shared-js
-ac_add_options --disable-shared-memory
 ac_add_options --disable-tests
 ac_add_options --disable-clang-plugin
 ac_add_options --enable-jitspew

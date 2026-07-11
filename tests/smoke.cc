@@ -126,6 +126,22 @@ int main() {
         // Probe only — upstream SpiderMonkey does not ship ShadowRealm either.
         r = js_eval(h, "typeof ShadowRealm");
         std::printf("     ShadowRealm: %s\n", r.c_str());
+
+        // Single-agent shared memory: SharedArrayBuffer and non-blocking
+        // Atomics are spec-conformant without any threads. Blocking waits are
+        // exercised with a zero timeout so neither legal outcome (immediate
+        // "timed-out" where [[CanBlock]], TypeError where not) can hang.
+        r = js_eval(h, "typeof SharedArrayBuffer + ',' + typeof Atomics");
+        std::printf("     shared: %s\n", r.c_str());
+        check(contains(r, "function,object"), "SharedArrayBuffer and Atomics exist");
+        r = js_eval(h, "const sab = new SharedArrayBuffer(8); const ia = new Int32Array(sab);"
+                       "Atomics.add(ia, 0, 41); Atomics.add(ia, 0, 1); Atomics.load(ia, 0)");
+        check(contains(r, "\"result\":\"42\""), "non-blocking Atomics work on a SharedArrayBuffer");
+        r = js_eval(h, "try { 'wait:' + Atomics.wait(new Int32Array(new SharedArrayBuffer(8)), 0, 0, 0) }"
+                       "catch (e) { 'threw:' + e.constructor.name }");
+        std::printf("     %s\n", r.c_str());
+        check(contains(r, "wait:timed-out") || contains(r, "threw:TypeError"),
+              "Atomics.wait with zero timeout returns or throws, never hangs");
     }
 
     // --- interrupt: infinite loop -----------------------------------------
