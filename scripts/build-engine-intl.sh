@@ -127,9 +127,14 @@ SM_OBJ_FILES=(
 rm -rf "$PKG"
 mkdir -p "$PKG"
 cp -R "$OBJ/dist/include" "$PKG/include"
-# dist/include ships without the build's config header; the smoke build and
-# every consumer -include it, so it travels with the archive.
-cp "$OBJ/js/src/js-confdefs.h" "$PKG/include/js-confdefs.h"
+# The generated config headers live in the objdir, not dist/include; every
+# consumer includes them (js-config.h via jstypes.h, js-confdefs.h via
+# -include), so they travel with the archive.
+for hdr in js-confdefs.h js-config.h; do
+    if [[ ! -f $PKG/include/$hdr ]]; then
+        cp "$OBJ/js/src/$hdr" "$PKG/include/$hdr"
+    fi
+done
 
 cp "$OBJ/js/src/build/libjs_static.a" "$PKG/libspidermonkey.a"
 missing=0
