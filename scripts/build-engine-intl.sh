@@ -116,13 +116,19 @@ cat "$MOZCONFIG"
 # --- build ---------------------------------------------------------------------
 # CC/CXX/AR target wasm32-wasi (the wasi-sdk toolchain); HOST_CC/HOST_CXX build
 # mach's host tools. Same split starlingmonkey/cmake/spidermonkey.cmake uses.
-env CC="$WASI_SDK_PATH/bin/clang" \
-    CXX="$WASI_SDK_PATH/bin/clang++" \
-    AR="$WASI_SDK_PATH/bin/llvm-ar" \
-    HOST_CC="${HOST_CC:-clang}" \
-    HOST_CXX="${HOST_CXX:-clang++}" \
-    MOZCONFIG="$MOZCONFIG" \
-    python3 "$SRC/mach" --no-interactive build
+mach_build() {
+    env CC="$WASI_SDK_PATH/bin/clang" \
+        CXX="$WASI_SDK_PATH/bin/clang++" \
+        AR="$WASI_SDK_PATH/bin/llvm-ar" \
+        HOST_CC="${HOST_CC:-clang}" \
+        HOST_CXX="${HOST_CXX:-clang++}" \
+        MOZCONFIG="$MOZCONFIG" \
+        python3 "$SRC/mach" --no-interactive build "$@"
+}
+mach_build
+# jsrust (encoding_rs + ICU4X capi + Temporal) is only demanded by the shell
+# link, and the shell is disabled; build the RustLibrary target explicitly.
+mach_build js/src/rust
 
 # --- package -------------------------------------------------------------------
 # libspidermonkey.a = libjs_static.a + the mozglue/mfbt/memory objects that are
@@ -209,6 +215,8 @@ fi
 # consumers use THIS ONE INSTEAD OF rust/'s (see run-smoke.sh).
 JSRUST=$(find "$OBJ" -name 'libjsrust.a' | head -1)
 if [[ -z $JSRUST ]]; then
+    echo "[engine] jsrust candidates in the objdir:" >&2
+    find "$OBJ" -iname '*jsrust*' >&2 || true
     echo "error: libjsrust.a not found in the objdir" >&2
     exit 1
 fi
