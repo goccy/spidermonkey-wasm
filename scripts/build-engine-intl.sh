@@ -127,8 +127,10 @@ mach_build() {
 }
 mach_build
 # jsrust (encoding_rs + ICU4X capi + Temporal) is only demanded by the shell
-# link, and the shell is disabled; build the RustLibrary target explicitly.
-mach_build js/src/rust
+# link, and the shell is disabled; build the RustLibrary explicitly.
+# force-cargo-library-build is mach's per-directory target that actually runs
+# cargo for a RustLibrary (building the bare directory only exports headers).
+mach_build js/src/rust/force-cargo-library-build
 
 # --- package -------------------------------------------------------------------
 # libspidermonkey.a = libjs_static.a + the mozglue/mfbt/memory objects that are
