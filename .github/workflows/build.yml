@@ -1,0 +1,178 @@
+name: build
+
+# Build + verify CI for spidermonkey-wasm. Runs the wasmify pipeline from a clean
+# checkout, produces `spidermonkey.wasm` (SpiderMonkey linked against the js.cc
+# embedding bridge) and the wasm2go bundle (`build/wasm2go/`, the transpiled
+# pure-Go form go-spidermonkey consumes), uploads them as a workflow artifact,
+# and attaches SLSA build-provenance attestations. It does NOT publish a GitHub
+# Release — release.yml owns that, on `v*` tags.
+#
+# Unlike python-wasm's, this pipeline runs on the HOST rather than inside
+# ghcr.io/goccy/wasmify. Two reasons:
+#
+#   * The image carries no Rust toolchain, and `make deps` builds a Rust
+#     staticlib (SpiderMonkey's string encoders live in the encoding_rs crate).
+#     GitHub's ubuntu runners ship cargo, so the host needs nothing extra.
+#   * There is no heavy native build to cache. The engine arrives prebuilt from
+#     the StarlingMonkey release the `starlingmonkey` submodule pins, so the only
+#     expensive steps are a 520 MB download and a ThinLTO link — both cheap next
+#     to a from-source CPython.
+#
+# There is likewise no cache image: `deps/` and `rust/target/` are a pure
+# function of the submodule pin and are keyed straight into actions/cache.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# This workflow only BUILDS and verifies (artifacts + provenance). It never
+# creates a GitHub Release — that is release.yml's job, gated to `v*` tags — so
+# pull requests and main pushes never publish. No `tags:` trigger here: a tag
+# push runs release.yml, which builds and releases in one place (no double
+# build, no race between two workflows uploading the same assets).
+permissions:
+  contents: read           # build-only: no release asset upload here
+  id-token: write          # actions/attest-build-provenance OIDC token
+  attestations: write
+
+env:
+  WASMIFY_VERSION: v0.4.9
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space on the runner
+        # ubuntu-latest ships ~14 GB free on `/`; the wasi-sdk toolchain, the
+        # 520 MB engine archive, the transpiled Go tree and the go build cache
+        # gcasm produces together crowd it, so reclaim the unused language SDKs.
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - uses: actions/checkout@v4
+        with:
+          # StarlingMonkey is a submodule: it pins the SpiderMonkey version
+          # scripts/fetch-spidermonkey.sh downloads, and it carries the Rust
+          # crates rust/ links against.
+          submodules: recursive
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install wasmify + the protoc plugin
+        run: |
+          go install github.com/goccy/wasmify/cmd/wasmify@${{ env.WASMIFY_VERSION }}
+          go install github.com/goccy/wasmify/protoc-plugins/protoc-gen-wasmify-go@${{ env.WASMIFY_VERSION }}
+
+      - uses: bufbuild/buf-setup-action@v1
+
+      # wasmify's own state: the per-project object cache and the shared
+      # wasi-sdk / binaryen toolchains it installs on first use.
+      - name: Cache wasmify state
+        uses: actions/cache@v4
+        with:
+          path: |
+            .wasmify
+            ~/.config/wasmify/bin
+          key: wasmify-${{ env.WASMIFY_VERSION }}-${{ runner.os }}-${{ hashFiles('wasmify.json', 'build.json', 'js.h', 'js.cc') }}
+          restore-keys: |
+            wasmify-${{ env.WASMIFY_VERSION }}-${{ runner.os }}-
+
+      # The engine (~520 MB) and the Rust staticlib are not committed, and both
+      # are a pure function of the submodule pin plus rust/Cargo.lock.
+      - name: Cache the prebuilt engine + Rust staticlib
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps/spidermonkey
+            rust/target
+          key: engine-${{ runner.os }}-${{ hashFiles('starlingmonkey/cmake/spidermonkey.cmake', 'starlingmonkey/rust-toolchain.toml', 'rust/Cargo.lock') }}
+
+      - name: Run the wasmify pipeline
+        # tools + deps + parse-headers + gen-proto + wasm-build + buf generate
+        # + bundle-gomod. The transpile step is long — protoc-gen-wasmify-go
+        # compiles the emitted Go in its gcasm backend — which is why the
+        # Makefile passes `buf generate --timeout 0` (buf's default 2-minute
+        # command timeout would otherwise SIGKILL the plugin mid-run).
+        run: make wasm
+
+      - name: Stage build artifacts
+        run: |
+          mkdir -p release
+          cp .wasmify/wasm-build/output/spidermonkey.wasm release/spidermonkey.wasm
+          cp build/wasm2go/spidermonkey.go release/spidermonkey_wasm2go.go
+          tar -czf release/spidermonkey_wasm2go.tar.gz -C build/wasm2go/internal/wasm2go .
+          ( cd build/wasm2go/internal/wasm2go && find . -type f -print0 | sort -z \
+              | xargs -0 sha256sum ) > release/spidermonkey_wasm2go.sha256
+
+      - uses: actions/attest-build-provenance@v2
+        # Skipped on user-owned private repos (the attestations API rejects
+        # those); re-enables itself when the repo is public.
+        if: github.event.repository.visibility == 'public'
+        with:
+          subject-path: |
+            release/spidermonkey.wasm
+            release/spidermonkey_wasm2go.go
+
+      - uses: actions/attest-build-provenance@v2
+        # wasm2go bundle: one attestation whose subjects are the per-file digests
+        # in the manifest, so any file extracted from the tarball verifies
+        # individually.
+        if: github.event.repository.visibility == 'public'
+        with:
+          subject-checksums: release/spidermonkey_wasm2go.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spidermonkey-wasm
+          path: release/
+          retention-days: 7
+
+  # Drive js.cc against the real engine under wasmtime, with no wasmify, no
+  # wasm2go and no Go in the picture — so a failure localises to the C++
+  # embedding layer rather than to the Go bindings. Runs both interrupt modes
+  # (address discovery, and the always-armed fallback).
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install wasmify
+        # For its wasi-sdk resolution; run-smoke.sh compiles with that toolchain.
+        run: go install github.com/goccy/wasmify/cmd/wasmify@${{ env.WASMIFY_VERSION }}
+
+      - uses: bytecodealliance/actions/wasmtime/setup@v1
+
+      - name: Cache the prebuilt engine + Rust staticlib
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps/spidermonkey
+            rust/target
+          key: engine-${{ runner.os }}-${{ hashFiles('starlingmonkey/cmake/spidermonkey.cmake', 'starlingmonkey/rust-toolchain.toml', 'rust/Cargo.lock') }}
+
+      - name: Cache the wasi-sdk toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.config/wasmify/bin
+          key: wasmify-${{ env.WASMIFY_VERSION }}-${{ runner.os }}-toolchain
+
+      - run: make tools
+      - run: make smoke

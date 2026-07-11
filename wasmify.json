@@ -1,0 +1,133 @@
+{
+  "version": "1.0",
+  "upstream": {
+    "path": "./starlingmonkey",
+    "commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
+    "branch": "main"
+  },
+  "project": {
+    "name": "spidermonkey",
+    "root_dir": "./starlingmonkey",
+    "language": "cpp",
+    "language_standard": "c++20"
+  },
+  "build_system": {
+    "type": "other",
+    "files": [
+      "starlingmonkey/cmake/spidermonkey.cmake",
+      "starlingmonkey/cmake/build-crates.cmake"
+    ]
+  },
+  "targets": [
+    {
+      "name": "spidermonkey",
+      "type": "library",
+      "build_target": "libspidermonkey.a",
+      "description": "SpiderMonkey (Firefox 147) built for wasm32-wasi with --disable-jit --enable-portable-baseline-interp. Published prebuilt by the StarlingMonkey project and downloaded by scripts/fetch-spidermonkey.sh; there is no source tree for wasmify to capture and replay, so build.json has no steps and the archive reaches the link through wasm_build.prebuilt_archives."
+    }
+  ],
+  "dependencies": [
+    {
+      "name": "wasi-sdk",
+      "type": "tool",
+      "required": true
+    },
+    {
+      "name": "rust",
+      "type": "tool",
+      "required": true
+    }
+  ],
+  "required_tools": [
+    {
+      "name": "cargo",
+      "installed": false,
+      "detect_cmd": "cargo --version",
+      "install": {
+        "darwin": {
+          "commands": [
+            "brew install rustup",
+            "rustup toolchain install 1.88.0 --profile minimal --target wasm32-wasip1"
+          ]
+        },
+        "debian": {
+          "commands": [
+            "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.88.0 --target wasm32-wasip1"
+          ]
+        }
+      }
+    }
+  ],
+  "build_commands": {
+    "configure": "bash scripts/fetch-spidermonkey.sh",
+    "build": "bash scripts/build-rust-crates.sh"
+  },
+  "output": {
+    "wasm": "build/spidermonkey.wasm"
+  },
+  "user_selection": {
+    "target_name": "spidermonkey",
+    "build_type": "library"
+  },
+  "bridge": {
+    "CustomBridgeSources": [
+      "js.cc",
+      "starlingmonkey/crates/rust-hooks/src/wrappers.cpp"
+    ],
+    "GoPackage": "github.com/goccy/go-spidermonkey;spidermonkey",
+    "Wasm2GoImportPath": "github.com/goccy/spidermonkeywasm2go",
+    "StackSize": 8388608,
+    "ExportFunctions": [
+      "js_new",
+      "js_eval",
+      "js_close",
+      "js_interrupt_addr",
+      "js_interrupt_bits_addr",
+      "js_interrupt_bits_value"
+    ]
+  },
+  "wasm_build": {
+    "prebuilt_archives": [
+      "deps/spidermonkey/libspidermonkey.a",
+      "rust/target/wasm32-wasip1/release/libspidermonkey_rust.a"
+    ],
+    "extra_cxxflags": [
+      "-std=gnu++20",
+      "-fno-rtti",
+      "-fno-exceptions",
+      "-fno-sized-deallocation",
+      "-fno-aligned-new",
+      "-mthread-model",
+      "single",
+      "-Wno-invalid-offsetof",
+      "-Wno-unknown-warning-option",
+      "-Wno-unused-result"
+    ],
+    "bridge_extra_includes": [
+      "deps/spidermonkey/include"
+    ],
+    "extra_ldflags": [
+      "-Wl,--stack-first",
+      "-lwasi-emulated-getpid"
+    ]
+  },
+  "phases": {
+    "gen-proto": {
+      "completed_at": "2026-07-10T14:35:10Z",
+      "upstream_commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
+      "output_files": [
+        "proto/spidermonkey.proto",
+        "proto/wasmify/options.proto",
+        "bridge/api_bridge.cc",
+        "bridge/api_bridge.h"
+      ]
+    },
+    "parse-headers": {
+      "completed_at": "2026-07-10T14:35:10Z",
+      "upstream_commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
+      "output_files": [
+        "api-spec.json"
+      ]
+    }
+  }
+}

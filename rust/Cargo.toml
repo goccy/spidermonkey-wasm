@@ -1,0 +1,37 @@
+# One staticlib bundling every Rust crate SpiderMonkey needs.
+#
+# libspidermonkey.a does not contain SpiderMonkey's string-encoding routines:
+# they live in the `encoding_rs` Rust crate, reached through the C ABI of
+# `encoding_c` / `encoding_c_mem`. Linking the engine therefore requires this
+# archive alongside it (see wasmify.json's wasm_build.prebuilt_archives).
+#
+# Both dependencies are the ones StarlingMonkey itself feeds to the same engine
+# build, taken from the pinned submodule rather than re-declared here — the
+# engine and the encoding crates have to agree on an ABI, and the submodule is
+# what pins the engine (see scripts/fetch-spidermonkey.sh).
+#
+# They are bundled into a SINGLE staticlib rather than one per crate because
+# each Rust staticlib carries its own copy of the Rust runtime symbols, and
+# linking two of them collides. This mirrors StarlingMonkey's
+# runtime/crates/staticlib-template, which exists for exactly that reason.
+[package]
+name = "spidermonkey-rust"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[lib]
+crate-type = ["staticlib"]
+path = "lib.rs"
+
+# Keep this crate out of any enclosing workspace.
+[workspace]
+
+[profile.release]
+lto = true
+panic = 'abort'
+opt-level = 3
+
+[dependencies]
+rust-encoding = { path = "../starlingmonkey/crates/rust-encoding" }
+rust-hooks = { path = "../starlingmonkey/crates/rust-hooks" }
