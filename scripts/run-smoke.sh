@@ -27,7 +27,9 @@ if ! command -v "$WASMTIME" >/dev/null; then
     exit 1
 fi
 
-SM=deps/spidermonkey
+# SPIDERMONKEY_DIST overrides the engine under test — e.g. build/engine-pkg,
+# the with-Intl archive scripts/build-engine-intl.sh produces.
+SM=${SPIDERMONKEY_DIST:-deps/spidermonkey}
 RUSTLIB=rust/target/wasm32-wasip1/release/libspidermonkey_rust.a
 for f in "$SM/libspidermonkey.a" "$RUSTLIB"; do
     if [[ ! -f $f ]]; then
@@ -77,16 +79,20 @@ status=0
 for mode in discovery fallback; do
     echo
     echo "[smoke] === $mode ==="
-    # Built as a full argv rather than appending to a possibly-empty array:
-    # under `set -u`, bash 3.2 (what macOS ships) treats "${empty[@]}" as an
-    # unbound variable and aborts.
+    # Built by growing a non-empty array: under `set -u`, bash 3.2 (what macOS
+    # ships) treats "${empty[@]}" as an unbound variable and aborts.
+    cmd=("$WASMTIME" run)
     if [[ $mode == fallback ]]; then
         # wasmtime does not forward the host environment to the guest, so the
         # variable has to be handed over explicitly.
-        cmd=("$WASMTIME" run --env SPIDERMONKEY_WASM_NO_INTERRUPT_DISCOVERY=1 "$out/smoke.wasm")
-    else
-        cmd=("$WASMTIME" run "$out/smoke.wasm")
+        cmd+=(--env SPIDERMONKEY_WASM_NO_INTERRUPT_DISCOVERY=1)
     fi
+    if [[ -n ${SPIDERMONKEY_WASM_EXPECT_INTL:-} ]]; then
+        # Tells smoke.cc to assert that Intl IS present (with-Intl engine
+        # builds); without it, smoke asserts Intl is absent.
+        cmd+=(--env SPIDERMONKEY_WASM_EXPECT_INTL=1)
+    fi
+    cmd+=("$out/smoke.wasm")
     if ! "${cmd[@]}"; then
         status=1
     fi

@@ -87,6 +87,29 @@ int main() {
     r = js_eval(h, "typeof fetch + ',' + typeof setTimeout + ',' + typeof read");
     check(contains(r, "undefined,undefined,undefined"), "no fetch/setTimeout/read builtins");
 
+    // Intl availability must match how the engine archive was built:
+    // SPIDERMONKEY_WASM_EXPECT_INTL=1 for --with-intl-api builds (see
+    // scripts/build-engine-intl.sh), unset for the --without-intl-api
+    // StarlingMonkey prebuilt. Asserting both directions keeps the two
+    // archive flavors from being swapped unnoticed.
+    const bool expect_intl = std::getenv("SPIDERMONKEY_WASM_EXPECT_INTL") != nullptr;
+    r = js_eval(h, "typeof Intl");
+    check(contains(r, expect_intl ? "\"result\":\"object\"" : "\"result\":\"undefined\""),
+          expect_intl ? "Intl is present (with-intl engine)" : "Intl is absent (without-intl engine)");
+    if (expect_intl) {
+        r = js_eval(h, "new Intl.NumberFormat('ja-JP').format(1234567)");
+        std::printf("     %s\n", r.c_str());
+        check(contains(r, "1,234,567"), "Intl.NumberFormat formats with locale data");
+        r = js_eval(h, "/\\p{Script=Hiragana}/u.test('\xe3\x81\x82') ? 'prop-ok' : 'no'");
+        check(contains(r, "prop-ok"), "regexp Unicode property escapes work");
+        r = js_eval(h, "'\\u0041\\u030A'.normalize('NFC') === '\\u00C5' ? 'nfc-ok' : 'no'");
+        check(contains(r, "nfc-ok"), "String.prototype.normalize works");
+        // Informational: what else this build ships (Temporal is expected to
+        // ride along with Intl in current SpiderMonkey).
+        r = js_eval(h, "typeof Temporal + ',' + typeof Intl.Segmenter");
+        std::printf("     extras: %s\n", r.c_str());
+    }
+
     // --- interrupt: infinite loop -----------------------------------------
     // Exactly what the Go host's Interrupter.Fire() does, in the same order:
     // the "host asked" flag first, then the bit that trips SpiderMonkey's poll.
