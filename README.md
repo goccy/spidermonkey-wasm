@@ -1,9 +1,6 @@
 # spidermonkey-wasm
 
-SpiderMonkey — Firefox's JavaScript engine — built for `wasm32-wasi` and exposed
-behind a four-function embedding API, so that
-[`goccy/go-spidermonkey`](https://github.com/goccy/go-spidermonkey) can run
-untrusted JavaScript from Go with no CGo and no wasm runtime.
+SpiderMonkey — Firefox's JavaScript engine — built for `wasm32-wasi`.
 
 This repository holds the wasm side: the embedding layer (`js.h` / `js.cc`), the
 [wasmify](https://github.com/goccy/wasmify) configuration that links it, and the
