@@ -72,6 +72,39 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes);
  * one atomic result. The Go wrapper unmarshals it. */
 std::string js_eval(uint64_t h, const std::string &src);
 
+/* ---- ES modules ------------------------------------------------------------
+ *
+ * The guest cannot call out to the host mid-link, so module loading is a
+ * REGISTRY: the host (Go) resolves specifiers to sources however it likes —
+ * filesystem, embedded maps, network, policy checks all live host-side — and
+ * registers them here before (or between) evaluations. The guest only does
+ * exact-match lookup plus ./ and ../ resolution against the importing module's
+ * specifier. An import that misses the registry fails with
+ * "module not registered: <resolved specifier>", which is the host's cue to
+ * fetch, register, and retry. Nothing is registered by default: with no
+ * registrations, every import fails (sandbox default-deny). */
+
+/* Compile `src` as an ES module and register it under `specifier`. Returns the
+ * usual JSON result; "ok" false carries the compile error. Re-registering a
+ * specifier replaces the module (affects future lookups only). */
+std::string js_module_register(uint64_t h, const std::string &specifier,
+                               const std::string &src);
+
+/* Compile `src` as an ES module registered under `specifier`, load its
+ * dependency graph from the registry, link, evaluate, and drain the job queue.
+ * Same JSON shape as js_eval: "ok" true when the module (including top-level
+ * await) evaluated to completion; "error" carries compile/link/import/runtime
+ * failures, or "module not registered: X" when an import misses the registry. */
+std::string js_eval_module(uint64_t h, const std::string &specifier,
+                           const std::string &src);
+
+/* Install the $262 test-support object (https://github.com/tc39/test262
+ * INTERPRETING.md) on this runtime's global: createRealm (same-compartment
+ * realm with its own $262), detachArrayBuffer, evalScript, gc, global, and an
+ * IsHTMLDDA object ([[IsHTMLDDA]], i.e. document.all emulation). NOT part of
+ * the sandbox surface — call it only from conformance harnesses. */
+void js_install_test262_hooks(uint64_t h);
+
 /* Destroy the runtime (JS_DestroyContext). JS_ShutDown runs at process
  * teardown, not here, so the handle is fully torn down but the process stays
  * usable. */
