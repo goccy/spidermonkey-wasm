@@ -30,7 +30,15 @@ fi
 # SPIDERMONKEY_DIST overrides the engine under test — e.g. build/engine-pkg,
 # the with-Intl archive scripts/build-engine-intl.sh produces.
 SM=${SPIDERMONKEY_DIST:-deps/spidermonkey}
-RUSTLIB=rust/target/wasm32-wasip1/release/libspidermonkey_rust.a
+# Exactly one Rust staticlib links into the wasm (each carries the Rust
+# runtime). With-intl engine dists ship mach's own jsrust (encoding_rs +
+# ICU4X + Temporal); the StarlingMonkey prebuilt ships none, so the thin
+# local staticlib (encoding_rs only) fills in.
+if [[ -f $SM/libjsrust.a ]]; then
+    RUSTLIB=$SM/libjsrust.a
+else
+    RUSTLIB=rust/target/wasm32-wasip1/release/libspidermonkey_rust.a
+fi
 for f in "$SM/libspidermonkey.a" "$RUSTLIB"; do
     if [[ ! -f $f ]]; then
         echo "error: $f missing. Run: make deps" >&2

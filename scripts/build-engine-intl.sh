@@ -171,6 +171,23 @@ if [[ -d $OBJ/config/external/icu ]]; then
     done < <(find "$OBJ/config/external/icu" -name '*.o')
 fi
 
+# jsrust: the Rust side of the engine (encoding_rs, and — with Intl on —
+# ICU4X capi and Temporal). Without-intl builds barely use it, which is why
+# the StarlingMonkey flow substitutes its own thin staticlib (rust/); a
+# with-intl engine references icu4x_* symbols from C++ and must link the
+# jsrust mach actually built. Ship it alongside; exactly one Rust staticlib
+# may be linked into the final wasm (each carries the Rust runtime), so
+# consumers use THIS ONE INSTEAD OF rust/'s (see run-smoke.sh).
+JSRUST=$(find "$OBJ" -name 'libjsrust.a' | head -1)
+if [[ -z $JSRUST ]]; then
+    echo "error: libjsrust.a not found in the objdir" >&2
+    exit 1
+fi
+echo "[engine] jsrust: $JSRUST"
+echo "[engine] jsrust icu4x members: $("$WASI_SDK_PATH/bin/llvm-ar" t "$JSRUST" | grep -ci icu || true)"
+echo "[engine] jsrust encoding members: $("$WASI_SDK_PATH/bin/llvm-ar" t "$JSRUST" | grep -ci encoding || true)"
+cp "$JSRUST" "$PKG/libjsrust.a"
+
 # fetch-spidermonkey.sh-shaped tarball: one top-level dir, stripped on unpack.
 tar -czf build/spidermonkey-static-intl-release.tar.gz \
     -C "$PKG/.." "$(basename "$PKG")" \
