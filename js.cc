@@ -461,6 +461,12 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
     static JSClass global_class = {"global", JSCLASS_GLOBAL_FLAGS, &JS::DefaultGlobalClassOps};
 
     JS::RealmOptions options;
+    /* Expose SharedArrayBuffer + Atomics when the engine carries them (the
+     * with-intl source build does; StarlingMonkey's prebuilt is configured
+     * --disable-shared-memory and ignores this). A single agent needs no
+     * threads for them: non-blocking Atomics are ordinary operations, and a
+     * blocking wait either throws or times out per [[CanBlock]]. */
+    options.creationOptions().setSharedMemoryAndAtomicsEnabled(true);
     JS::RootedObject global(
         g_cx, JS_NewGlobalObject(g_cx, &global_class, nullptr, JS::FireOnNewGlobalHook, options));
     if (!global) {
