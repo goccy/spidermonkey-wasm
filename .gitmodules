@@ -1,0 +1,3 @@
+[submodule "starlingmonkey"]
+	path = starlingmonkey
+	url = https://github.com/bytecodealliance/StarlingMonkey.git

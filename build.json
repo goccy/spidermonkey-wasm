@@ -1,0 +1,11 @@
+{
+  "version": "1.0",
+  "project": {
+    "name": "spidermonkey",
+    "root_dir": ".",
+    "build_type": "library",
+    "build_system": "other"
+  },
+  "steps": [],
+  "captured_at": "2026-07-10T00:00:00Z"
+}
