@@ -417,6 +417,23 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
     }
     if (native_stack_quota_bytes) {
         JS_SetNativeStackQuota(g_cx, native_stack_quota_bytes);
+#ifdef JS_HAS_MUTABLE_WASI_RECURSION_LIMIT
+        /* On wasi, SpiderMonkey bounds recursion with a depth counter, not
+         * the native-stack quota — JS_SetNativeStackQuota alone is a no-op
+         * for recursion depth. Engines built by scripts/build-engine-intl.sh
+         * carry a patch that makes the counter's ceiling per-context; scale
+         * it with the quota at upstream's own tuning ratio (350 units per
+         * 1 MiB of stack, the shell's link size), clamped between upstream's
+         * default and what the 8 MiB stack this wasm links with can carry. */
+        uint64_t depth = (uint64_t)native_stack_quota_bytes * 350 / (1u << 20);
+        if (depth < 350) {
+            depth = 350;
+        }
+        if (depth > 2800) {
+            depth = 2800;
+        }
+        JS::RootingContext::get(g_cx)->wasiRecursionDepthLimit = (uint32_t)depth;
+#endif
     }
 
     /* Promise jobs are queued and drained by us at the end of each js_eval; no

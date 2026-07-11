@@ -177,6 +177,25 @@ int main() {
     js_close(h);
     check(true, "js_close");
 
+    // --- scaled recursion ceiling (source-built engines only) ---------------
+    // Engines from scripts/build-engine-intl.sh carry the mutable wasi
+    // recursion-limit patch: js_new scales the depth ceiling with the stack
+    // quota. 60 nested function literals exceed the upstream fixed ceiling
+    // (parse recursion hits it at ~29 with the 350-unit constant) and must
+    // parse once a 4 MiB quota raises it.
+    if (expect_intl) {
+        h = js_new(64u * 1024 * 1024, 4u * 1024 * 1024);
+        check(h != 0, "js_new with a 4 MiB quota");
+        std::string deep;
+        for (int i = 0; i < 60; i++) deep += "(function(){return ";
+        deep += "1";
+        for (int i = 0; i < 60; i++) deep += "})()";
+        r = js_eval(h, deep.c_str());
+        std::printf("     deep-nest: %.120s\n", r.c_str());
+        check(contains(r, "\"result\":\"1\""), "recursion ceiling scales with the stack quota");
+        js_close(h);
+    }
+
     std::printf("\n%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
     return failures ? 1 : 0;
 }

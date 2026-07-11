@@ -49,6 +49,35 @@ if [[ ! -d $SRC/.git ]]; then
         https://github.com/bytecodealliance/firefox.git "$SRC"
 fi
 
+# --- source patches ------------------------------------------------------------
+# On __wasi__, SpiderMonkey bounds recursion with a DEPTH COUNTER, not
+# stack-pointer checks: AutoCheckRecursionLimit increments
+# RootingContext::wasiRecursionDepth and CheckWasiRecursionLimit compares it
+# against wasiRecursionDepthLimit — a `static constexpr 350`, tuned for the
+# 1 MiB stack the upstream shell links with (js/src/shell/moz.build). It
+# silently ignores JS_SetNativeStackQuota, so an embedding linking an 8 MiB
+# stack (this project) is stuck at a ceiling its stack could carry 8x over.
+#
+# Make the limit a mutable per-context field with the same default, and
+# advertise it with JS_HAS_MUTABLE_WASI_RECURSION_LIMIT so js.cc can scale it
+# from js_new's native_stack_quota_bytes. Applied as verified targeted edits
+# rather than a context diff, so an engine-tag bump that moves the code fails
+# the build loudly instead of shipping an unpatched engine.
+f=$SRC/js/public/RootingAPI.h
+if ! grep -q 'JS_HAS_MUTABLE_WASI_RECURSION_LIMIT' "$f"; then
+    perl -0pi -e 's/static constexpr uint32_t wasiRecursionDepthLimit = 350u;/uint32_t wasiRecursionDepthLimit = 350u;\n#  define JS_HAS_MUTABLE_WASI_RECURSION_LIMIT 1/' "$f"
+fi
+grep -q 'JS_HAS_MUTABLE_WASI_RECURSION_LIMIT' "$f" || {
+    echo "error: wasi recursion-limit patch no longer applies to $f" >&2
+    exit 1
+}
+f=$SRC/js/src/vm/JSContext.cpp
+perl -0pi -e 's/JS::RootingContext::wasiRecursionDepthLimit\b/JS::RootingContext::get(cx)->wasiRecursionDepthLimit/g' "$f"
+grep -q 'get(cx)->wasiRecursionDepthLimit' "$f" || {
+    echo "error: wasi recursion-limit patch no longer applies to $f" >&2
+    exit 1
+}
+
 # --- mozconfig -----------------------------------------------------------------
 # StarlingMonkey's release mozconfig, verbatim, with ONE change: no
 # --without-intl-api line, so the build defaults to --with-intl-api and
