@@ -37,13 +37,36 @@ if [[ -z ${SM_TAG:-} ]]; then
 fi
 echo "[engine] SM_TAG=$SM_TAG"
 
-SRC=$repo_root/build/engine-src
-OBJ=$repo_root/build/engine-obj
-PKG=$repo_root/build/engine-pkg
+# BUILD_ROOT relocates the (huge, case-sensitive) build tree. gecko cannot be
+# built on a case-insensitive filesystem — it has both string.h and String.h —
+# so a container build on a macOS bind mount must put the tree on the
+# container's own filesystem and copy only the finished archive back.
+build_root=${BUILD_ROOT:-$repo_root/build}
+mkdir -p "$build_root"
+SRC=$build_root/engine-src
+OBJ=$build_root/engine-obj
+PKG=$build_root/engine-pkg
 
 # --- source ------------------------------------------------------------------
 # bytecodealliance/firefox is the fork StarlingMonkey builds from; the tag
 # carries their wasi fixes for exactly this engine version.
+# Reuse an existing checkout when it is already at the right tag: the tree is
+# ~5 GB and mach builds incrementally, so a cached BUILD_ROOT (a container
+# volume, say) turns a 15-minute rebuild into a 2-minute one. A checkout at a
+# DIFFERENT tag is refetched; a dirty one is reset, because the patches below
+# are applied in place and re-applying them to an already-patched tree would
+# fail its own verification.
+if [[ -d $SRC/.git ]]; then
+    have=$(git -C "$SRC" describe --tags --exact-match 2>/dev/null || git -C "$SRC" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+    if [[ $have == "$SM_TAG" ]]; then
+        echo "[engine] reusing cached checkout at $SM_TAG"
+        git -C "$SRC" checkout -- . 2>/dev/null || true
+        git -C "$SRC" clean -qfd 2>/dev/null || true
+    else
+        echo "[engine] cached checkout is at '$have', want $SM_TAG — refetching"
+        rm -rf "$SRC"
+    fi
+fi
 if [[ ! -d $SRC/.git ]]; then
     git clone --depth 1 --branch "$SM_TAG" \
         https://github.com/bytecodealliance/firefox.git "$SRC"
@@ -111,6 +134,92 @@ grep -q '__wasm32__' "$f" || {
     exit 1
 }
 
+
+# --- threads patches (SPIDERMONKEY_THREADS=1) --------------------------------
+# WASI's threading in gecko is hard-wired OFF: js/src/moz.build picks
+# threading/noop/NoopThread.cpp and mozglue/misc/moz.build picks
+# Mutex_noop/ConditionVariable_noop for OS_ARCH == WASI ("WASI hasn't supported
+# thread yet"). Neither -pthread nor the wasm32-wasi-threads sysroot changes
+# that — the first threads build produced a js-confdefs.h byte-identical to the
+# single-agent one. Real agents need the POSIX implementations, which work
+# because wasi-libc's threads build provides pthreads on top of
+# wasi_thread_spawn (a goroutine, under wasm2go).
+if [[ -n ${SPIDERMONKEY_THREADS:-} ]]; then
+    f=$SRC/js/src/moz.build
+    perl -0pi -e 's{# WASI hasn.t supported thread yet so noop implementation is used\.\nelif CONFIG\["OS_ARCH"\] == "WASI":\n    UNIFIED_SOURCES \+= \[\n        "threading/noop/CpuCount\.cpp",\n        "threading/noop/NoopThread\.cpp",\n    \]\n}{# wasi-threads: pthreads come from wasi-libc, backed by wasi_thread_spawn.\nelif CONFIG["OS_ARCH"] == "WASI":\n    UNIFIED_SOURCES += [\n        "threading/posix/CpuCount.cpp",\n        "threading/posix/PosixThread.cpp",\n    ]\n}' "$f"
+    grep -q 'threading/posix/PosixThread.cpp' "$f" || {
+        echo "error: WASI threading patch no longer applies to $f" >&2
+        exit 1
+    }
+
+    # PlatformMutex.h / PlatformConditionVariable.h reserve a fixed dummy
+    # buffer for __wasi__ instead of sizing it from pthread_mutex_t /
+    # pthread_cond_t (they assume WASI has no pthreads). With the real posix
+    # implementations that buffer is too small — the static_assert fires. Let
+    # wasi size it from the pthread types like every other posix platform.
+    for f in $SRC/mozglue/misc/PlatformMutex.h $SRC/mozglue/misc/PlatformConditionVariable.h; do
+        # /g: each header carries the guard TWICE (the pthread.h include and the
+        # platformData_ sizing). Patching only the first left the dummy buffer in
+        # place and the static_assert still fired.
+        perl -0pi -e 's/#if !defined\(XP_WIN\) && !defined\(__wasi__\)/#if !defined(XP_WIN)/g' "$f"
+        if grep -q '__wasi__' "$f"; then
+            echo "error: wasi platform-data patch left a __wasi__ guard in $f" >&2
+            exit 1
+        fi
+    done
+
+    # ThisThread::SetName's fallback branch calls pthread_setname_np
+    # unconditionally, but wasi-libc has no such function (configure detects
+    # that and defines neither HAVE_PTHREAD_SETNAME_NP nor its variants — yet
+    # the #else still calls it, so the link fails on an undefined symbol).
+    # Thread names are debug ergonomics only; make it a no-op on wasi.
+    f=$SRC/js/src/threading/posix/PosixThread.cpp
+    perl -0pi -e 's/  int rv;\n#ifdef XP_DARWIN/  int rv;\n#if defined(__wasi__)\n  \/\* wasi-libc has no pthread_setname_np; thread names are debug-only. *\/\n  (void)name;\n  rv = 0;\n#elif defined(XP_DARWIN)/' "$f"
+    grep -q '#if defined(__wasi__)' "$f" || {
+        echo "error: wasi setname patch no longer applies to $f" >&2
+        exit 1
+    }
+
+    # The Rust side must carry the atomics/bulk-memory features too, or wasm-ld
+    # refuses --shared-memory ("not compiled with 'atomics' or 'bulk-memory'").
+    # Rust ships a wasm32-wasip1-threads target whose PREBUILT std has them;
+    # gecko derives the rust target from the C triple and has no override, so
+    # teach rust.configure to honour one.
+    f=$SRC/build/moz.configure/rust.configure
+    if ! grep -q 'MOZ_RUST_TARGET_OVERRIDE' "$f"; then
+        # The configure sandbox forbids bare `import`; @imports is its blessed
+        # mechanism for pulling in environ.
+        perl -0pi -e 's/\@checking\("for rust target triplet"\)\ndef rust_target_triple\(/\@checking("for rust target triplet")\n\@imports(_from="os", _import="environ")\ndef rust_target_triple(/' "$f"
+        perl -0pi -e 's/    rustc_target = detect_rustc_target\(\n        target, compiler_info, arm_target, rust_supported_targets\n    \)/    _override = environ.get("MOZ_RUST_TARGET_OVERRIDE")\n    if _override:\n        assert_rust_compile(target, _override, rustc)\n        return _override\n    rustc_target = detect_rustc_target(\n        target, compiler_info, arm_target, rust_supported_targets\n    )/' "$f"
+    fi
+    grep -q 'MOZ_RUST_TARGET_OVERRIDE' "$f" || {
+        echo "error: rust-target override patch no longer applies to $f" >&2
+        exit 1
+    }
+    export MOZ_RUST_TARGET_OVERRIDE=wasm32-wasip1-threads
+    rustup target add wasm32-wasip1-threads >/dev/null 2>&1 || true
+
+    f=$SRC/mozglue/misc/moz.build
+    perl -0pi -e 's{# WASI hasn.t supported cond vars and mutexes yet so noop implementation is used\.\nelif CONFIG\["OS_ARCH"\] == "WASI":\n    SOURCES \+= \[\n        "ConditionVariable_noop\.cpp",\n        "Mutex_noop\.cpp",\n    \]\n}{# wasi-threads: real mutexes and condvars, on wasi-libc pthreads.\nelif CONFIG["OS_ARCH"] == "WASI":\n    SOURCES += [\n        "ConditionVariable_posix.cpp",\n        "Mutex_posix.cpp",\n        "RWLock_posix.cpp",\n    ]\n}' "$f"
+    grep -q 'Mutex_posix.cpp' "$f" || {
+        echo "error: WASI mutex patch no longer applies to $f" >&2
+        exit 1
+    }
+fi
+
+
+# gecko's mozinfo assumes a macOS version like "15.3" and indexes the minor
+# component; macOS 26 reports a bare "26" and mach dies with IndexError before
+# configure even starts. Only bites local (Darwin) builds.
+if [[ $(uname -s) == Darwin ]]; then
+    f=$SRC/testing/mozbase/mozinfo/mozinfo/mozinfo.py
+    perl -0pi -e 's/os_version = f"\{versionNums\[0\]\}\.\{versionNums\[1\]\.ljust\(2, .0.\)\}"/os_version = f"{versionNums[0]}.{(versionNums[1] if len(versionNums) > 1 else \x270\x27).ljust(2, \x270\x27)}"/' "$f"
+    grep -q 'if len(versionNums) > 1' "$f" || {
+        echo "error: macOS version patch no longer applies to $f" >&2
+        exit 1
+    }
+fi
+
 # --- mozconfig -----------------------------------------------------------------
 # StarlingMonkey's release mozconfig, verbatim, with ONE change: no
 # --without-intl-api line, so the build defaults to --with-intl-api and
@@ -136,9 +245,19 @@ mkdir -p "$(dirname "$MOZCONFIG")"
 # wasm32-wasi-threads sysroot with -pthread gives it pthreads, TLS and atomics,
 # which is what js/src/threading/posix and mozglue's real (non-noop) mutexes
 # need. So the threads build differs only in the flags mach_build passes.
+# The threads build must compile EVERY object against wasi-libc's threads
+# flavor with the atomics/bulk-memory features on, or wasm-ld later refuses
+# --shared-memory. gecko's configure cannot be told --target=wasm32-wasi-threads
+# directly (config.sub parses the triple as OS "threads" and rejects it), so
+# the mozconfig target stays wasm32-unknown-wasi and the REAL target rides in
+# CFLAGS/CXXFLAGS: clang honours the LAST --target on the command line, and
+# user flags come after configure's. Verified: a probe object built this way
+# carries "+atomics +bulk-memory" in target_features; without, it doesn't.
 THREADS_MOZOPTS=""
 if [[ -n ${SPIDERMONKEY_THREADS:-} ]]; then
     echo "[engine] threads build (wasm32-wasi-threads sysroot, -pthread)"
+    THREADS_MOZOPTS='export CFLAGS="--target=wasm32-wasi-threads -pthread"
+export CXXFLAGS="--target=wasm32-wasi-threads -pthread"'
 fi
 
 cat > "$MOZCONFIG" <<EOF
@@ -159,7 +278,9 @@ ac_add_options --with-sysroot=$WASI_SDK_PATH/share/wasi-sysroot
 ac_add_options --disable-debug
 ac_add_options --enable-lto=thin
 mk_add_options MOZ_OBJDIR=$OBJ
-mk_add_options AUTOCLOBBER=1
+# No AUTOCLOBBER: mach rebuilds incrementally, which is what makes a cached
+# objdir worth keeping. A configure-affecting change still triggers its own
+# reconfigure.
 EOF
 case "$(uname -s)" in
 Linux)  echo "ac_add_options --disable-stdcxx-compat" >> "$MOZCONFIG" ;;
@@ -193,11 +314,9 @@ SM_OBJ_FILES=(
     mfbt/Unified_cpp_mfbt0.o
     mfbt/Unified_cpp_mfbt1.o
     mozglue/misc/AutoProfilerLabel.o
-    mozglue/misc/ConditionVariable_noop.o
     mozglue/misc/Debug.o
     mozglue/misc/Decimal.o
     mozglue/misc/MmapFaultHandler.o
-    mozglue/misc/Mutex_noop.o
     mozglue/misc/Now.o
     mozglue/misc/Printf.o
     mozglue/misc/SIMD.o
@@ -211,6 +330,22 @@ SM_OBJ_FILES=(
     mozglue/static/xxhash.o
     third_party/fmt/Unified_cpp_third_party_fmt0.o
 )
+
+# The mutex/condvar objects depend on the flavor: the single-agent build gets
+# mozglue's noop implementations, a threads build the real posix ones (which is
+# what the moz.build patch above selects).
+if [[ -n ${SPIDERMONKEY_THREADS:-} ]]; then
+    SM_OBJ_FILES+=(
+        mozglue/misc/ConditionVariable_posix.o
+        mozglue/misc/Mutex_posix.o
+        mozglue/misc/RWLock_posix.o
+    )
+else
+    SM_OBJ_FILES+=(
+        mozglue/misc/ConditionVariable_noop.o
+        mozglue/misc/Mutex_noop.o
+    )
+fi
 
 rm -rf "$PKG"
 mkdir -p "$PKG"
@@ -266,7 +401,16 @@ fi
 # jsrust mach actually built. Ship it alongside; exactly one Rust staticlib
 # may be linked into the final wasm (each carries the Rust runtime), so
 # consumers use THIS ONE INSTEAD OF rust/'s (see run-smoke.sh).
-JSRUST=$(find "$OBJ" -name 'libjsrust.a' | head -1)
+# Pick the staticlib for THIS build's rust target, not `find | head -1`: a
+# cached objdir can hold both wasm32-wasip1/ and wasm32-wasip1-threads/, and
+# shipping the non-threads jsrust in a threads engine reintroduces the exact
+# wasm-ld --shared-memory rejection the threads rust target exists to fix.
+if [[ -n ${SPIDERMONKEY_THREADS:-} ]]; then
+    JSRUST=$OBJ/wasm32-wasip1-threads/release/libjsrust.a
+else
+    JSRUST=$OBJ/wasm32-wasip1/release/libjsrust.a
+fi
+[[ -f $JSRUST ]] || JSRUST=$(find "$OBJ" -name 'libjsrust.a' | head -1)
 if [[ -z $JSRUST ]]; then
     echo "[engine] jsrust candidates in the objdir:" >&2
     find "$OBJ" -iname '*jsrust*' >&2 || true
@@ -279,8 +423,9 @@ echo "[engine] jsrust encoding members: $("$WASI_SDK_PATH/bin/llvm-ar" t "$JSRUS
 cp "$JSRUST" "$PKG/libjsrust.a"
 
 # fetch-spidermonkey.sh-shaped tarball: one top-level dir, stripped on unpack.
-tar -czf build/spidermonkey-static-intl-release.tar.gz \
+mkdir -p "$repo_root/build"
+tar -czf "$repo_root/build/spidermonkey-static-intl-release.tar.gz" \
     -C "$PKG/.." "$(basename "$PKG")" \
     --transform "s|^$(basename "$PKG")|spidermonkey-dist-intl-release|"
 echo "[engine] wrote build/spidermonkey-static-intl-release.tar.gz"
-ls -lh build/spidermonkey-static-intl-release.tar.gz "$PKG/libspidermonkey.a"
+ls -lh "$repo_root/build/spidermonkey-static-intl-release.tar.gz" "$PKG/libspidermonkey.a"

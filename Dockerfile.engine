@@ -1,0 +1,34 @@
+# Linux build environment for the SpiderMonkey engine (scripts/build-engine-intl.sh).
+# gecko's mach only supports Linux/Windows hosts for a wasi cross-build; on macOS
+# it dies in host detection long before configure. Running it in a container is
+# what makes the engine build reproducible on any dev machine — and identical to
+# what CI does.
+FROM ubuntu:24.04
+
+ARG WASI_SDK_VERSION=30
+ARG RUST_VERSION=1.88.0
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates clang curl git \
+        libclang-dev llvm-dev lld \
+        python3 python3-pip python3-venv \
+        pkg-config unzip xz-utils zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+# wasi-sdk: the wasm32-wasi-threads sysroot (pthreads, TLS, atomics) lives here.
+# wasi-sdk names its aarch64 asset "arm64"; x86_64 keeps its own name.
+RUN arch=$(uname -m) && case "$arch" in aarch64) arch=arm64 ;; esac && \
+    curl -fL --proto '=https' --tlsv1.2 -o /tmp/wasi-sdk.tar.gz \
+      "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-${arch}-linux.tar.gz" \
+    && tar -xzf /tmp/wasi-sdk.tar.gz -C /opt && rm /tmp/wasi-sdk.tar.gz \
+    && ln -s "/opt/wasi-sdk-${WASI_SDK_VERSION}.0-${arch}-linux" /opt/wasi-sdk
+ENV WASI_SDK_PATH=/opt/wasi-sdk
+
+# rust + cbindgen: SpiderMonkey's own Rust crates (encoding_rs, ICU4X, Temporal).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION} --target wasm32-wasip1
+ENV PATH=/root/.cargo/bin:$PATH
+RUN cargo install cbindgen --locked
+
+WORKDIR /src

@@ -29,6 +29,8 @@
 #include <jsfriendapi.h>
 
 #include <js/ArrayBuffer.h>
+#include <js/SharedArrayBuffer.h>
+#include <js/StructuredClone.h>
 #include <js/CompilationAndEvaluation.h>
 #include <js/Context.h>
 #include <js/Conversions.h>
@@ -52,6 +54,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -733,6 +736,352 @@ static bool test262_create_realm(JSContext *cx, unsigned argc, JS::Value *vp) {
 }
 
 /* Build the $262 object for `global` and define it there. Returns it. */
+
+/* ---- $262.agent (test262 agents; threads builds only) ---------------------
+ *
+ * test262's agent model: $262.agent.start(src) runs src on a NEW agent — its
+ * own thread, its own JSRuntime/JSContext/global — sharing nothing with the
+ * parent but SharedArrayBuffer memory. Agents talk through
+ * $262.agent.broadcast(sab) / receiveBroadcast(cb) and report(str) /
+ * getReport().
+ *
+ * A thread here is a pthread, which wasi-libc turns into a wasi_thread_spawn —
+ * which wasm2go runs on a GOROUTINE. So the whole chain is: guest JS agent ->
+ * SpiderMonkey thread -> pthread -> wasi_thread_spawn -> goroutine.
+ *
+ * Only compiled when the engine was built for wasi-threads
+ * (scripts/build-engine-intl.sh with SPIDERMONKEY_THREADS=1); the
+ * single-agent build leaves $262.agent absent, and the test262 runner skips
+ * the agent tests exactly as before.
+ */
+#ifdef SPIDERMONKEY_WASM_THREADS
+
+#include <pthread.h>
+
+#include <deque>
+#include <mutex>
+
+/* The broadcast rendezvous: the parent publishes one SAB (+ an int32 payload,
+ * which is all test262 sends) and every started agent picks it up in its own
+ * receiveBroadcast callback. Reports flow back the other way. */
+struct AgentState {
+    std::mutex mu;
+    std::deque<std::string> reports;
+
+    /* The broadcast SAB, serialized. Public JSAPI has no "wrap this memory as a
+     * SharedArrayBuffer" entry point; the SPEC route — and the one the
+     * SpiderMonkey shell takes — is a structured clone with shared-memory
+     * objects allowed, which hands every agent a SAB backed by the SAME
+     * memory (that is what makes it *shared*, as opposed to copied). */
+    std::unique_ptr<JSAutoStructuredCloneBuffer> sab_clone;
+    int32_t sab_payload = 0;
+    bool broadcast_ready = false;
+};
+
+static AgentState g_agents;
+
+static void agent_milestone(const char *what) {
+    std::lock_guard<std::mutex> lock(g_agents.mu);
+    g_agents.reports.emplace_back(std::string("[milestone] ") + what);
+}
+
+
+struct AgentStart {
+    std::string src;
+};
+
+static bool agent_report(JSContext *cx, unsigned argc, JS::Value *vp) {
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    JS::RootedString str(cx, JS::ToString(cx, args.get(0)));
+    if (!str) {
+        return false;
+    }
+    JS::UniqueChars utf8 = JS_EncodeStringToUTF8(cx, str);
+    if (!utf8) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_agents.mu);
+        g_agents.reports.emplace_back(utf8.get());
+    }
+    args.rval().setUndefined();
+    return true;
+}
+
+static bool agent_get_report(JSContext *cx, unsigned argc, JS::Value *vp) {
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    std::string msg;
+    {
+        std::lock_guard<std::mutex> lock(g_agents.mu);
+        if (g_agents.reports.empty()) {
+            args.rval().setNull();
+            return true;
+        }
+        msg = g_agents.reports.front();
+        g_agents.reports.pop_front();
+    }
+    JS::RootedString str(cx, JS_NewStringCopyN(cx, msg.data(), msg.size()));
+    if (!str) {
+        return false;
+    }
+    args.rval().setString(str);
+    return true;
+}
+
+static bool agent_sleep(JSContext *cx, unsigned argc, JS::Value *vp) {
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    double ms = 0;
+    if (!JS::ToNumber(cx, args.get(0), &ms)) {
+        return false;
+    }
+    if (ms > 0) {
+        struct timespec ts;
+        ts.tv_sec = (time_t)(ms / 1000);
+        ts.tv_nsec = (long)((ms - (double)ts.tv_sec * 1000) * 1e6);
+        nanosleep(&ts, nullptr);
+    }
+    args.rval().setUndefined();
+    return true;
+}
+
+static bool agent_leaving(JSContext *cx, unsigned argc, JS::Value *vp) {
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    args.rval().setUndefined();
+    return true;
+}
+
+static bool agent_monotonic_now(JSContext *cx, unsigned argc, JS::Value *vp) {
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    args.rval().setNumber((double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6);
+    return true;
+}
+
+/* Parent side: publish the SAB every agent's receiveBroadcast will wrap. */
+static bool agent_broadcast(JSContext *cx, unsigned argc, JS::Value *vp) {
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    if (!args.get(0).isObject()) {
+        JS_ReportErrorASCII(cx, "$262.agent.broadcast: expected a SharedArrayBuffer");
+        return false;
+    }
+    JS::RootedObject sab(cx, &args[0].toObject());
+    if (!JS::IsSharedArrayBufferObject(sab)) {
+        JS_ReportErrorASCII(cx, "$262.agent.broadcast: expected a SharedArrayBuffer");
+        return false;
+    }
+    int32_t payload = 0;
+    if (args.hasDefined(1) && !JS::ToInt32(cx, args.get(1), &payload)) {
+        return false;
+    }
+
+    /* SameProcess scope + allowSharedMemoryObjects: the clone carries a
+     * reference to the shared memory, not a copy of it. */
+    auto clone = std::make_unique<JSAutoStructuredCloneBuffer>(
+        JS::StructuredCloneScope::SameProcess, nullptr, nullptr);
+    JS::CloneDataPolicy policy;
+    policy.allowSharedMemoryObjects();
+    /* SABs are "intra-cluster clonable shared objects": without this second
+     * bit the clone throws the browser-flavoured COOP/COEP TypeError. All
+     * agents here live in one process — one agent cluster by construction. */
+    policy.allowIntraClusterClonableSharedObjects();
+    JS::RootedValue sabVal(cx, JS::ObjectValue(*sab));
+    if (!clone->write(cx, sabVal, JS::UndefinedHandleValue, policy)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_agents.mu);
+        g_agents.sab_clone = std::move(clone);
+        g_agents.sab_payload = payload;
+        g_agents.broadcast_ready = true;
+    }
+    args.rval().setUndefined();
+    return true;
+}
+
+/* Agent side: install $262.agent with the child-only entry points. */
+static bool agent_receive_broadcast(JSContext *cx, unsigned argc, JS::Value *vp);
+
+static JSObject *install_agent_child(JSContext *cx, JS::HandleObject global) {
+    JS::RootedObject hooks(cx, JS_NewPlainObject(cx));
+    JS::RootedObject agent(cx, JS_NewPlainObject(cx));
+    if (!hooks || !agent) {
+        return nullptr;
+    }
+    if (!JS_DefineFunction(cx, agent, "receiveBroadcast", agent_receive_broadcast, 1, 0) ||
+        !JS_DefineFunction(cx, agent, "report", agent_report, 1, 0) ||
+        !JS_DefineFunction(cx, agent, "sleep", agent_sleep, 1, 0) ||
+        !JS_DefineFunction(cx, agent, "leaving", agent_leaving, 0, 0) ||
+        !JS_DefineFunction(cx, agent, "monotonicNow", agent_monotonic_now, 0, 0)) {
+        return nullptr;
+    }
+    JS::RootedValue agentVal(cx, JS::ObjectValue(*agent));
+    if (!JS_DefineProperty(cx, hooks, "agent", agentVal, JSPROP_ENUMERATE)) {
+        return nullptr;
+    }
+    JS::RootedValue globalVal(cx, JS::ObjectValue(*global));
+    if (!JS_DefineProperty(cx, hooks, "global", globalVal, JSPROP_ENUMERATE)) {
+        return nullptr;
+    }
+    JS::RootedValue hooksVal(cx, JS::ObjectValue(*hooks));
+    if (!JS_DefineProperty(cx, global, "$262", hooksVal, JSPROP_ENUMERATE)) {
+        return nullptr;
+    }
+    return hooks;
+}
+
+/* The agent's receiveBroadcast: block until the parent has broadcast, then
+ * hand the callback a SharedArrayBuffer wrapping the SAME memory. */
+static bool agent_receive_broadcast(JSContext *cx, unsigned argc, JS::Value *vp) {
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    if (!args.get(0).isObject() || !JS::IsCallable(&args[0].toObject())) {
+        JS_ReportErrorASCII(cx, "$262.agent.receiveBroadcast: expected a callback");
+        return false;
+    }
+    JS::RootedValue cb(cx, args[0]);
+
+    /* Park until the parent broadcasts. Each agent reads the clone buffer under
+     * the lock and deserializes it into ITS OWN runtime; the SAB that comes out
+     * points at the same memory the parent's does. */
+    JS::RootedValue sabVal(cx);
+    int32_t payload = 0;
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lock(g_agents.mu);
+            if (g_agents.broadcast_ready && g_agents.sab_clone) {
+                JS::CloneDataPolicy policy;
+                policy.allowSharedMemoryObjects();
+                policy.allowIntraClusterClonableSharedObjects();
+                if (!g_agents.sab_clone->read(cx, &sabVal, policy, nullptr, nullptr)) {
+                    return false;
+                }
+                payload = g_agents.sab_payload;
+                break;
+            }
+        }
+        struct timespec ts = {0, 200000}; /* 0.2 ms */
+        nanosleep(&ts, nullptr);
+    }
+
+    JS::RootedValueArray<2> cbArgs(cx);
+    cbArgs[0].set(sabVal);
+    cbArgs[1].setInt32(payload);
+    JS::RootedValue rval(cx);
+    if (!JS_CallFunctionValue(cx, nullptr, cb, cbArgs, &rval)) {
+        return false;
+    }
+    args.rval().setUndefined();
+    return true;
+}
+
+/* One agent = one thread = one runtime. */
+static void *agent_thread_main(void *arg) {
+    std::unique_ptr<AgentStart> start(static_cast<AgentStart *>(arg));
+
+    JSContext *cx = JS_NewContext(JS::DefaultHeapMaxBytes);
+    if (!cx) {
+        agent_milestone("JS_NewContext FAILED");
+        return nullptr;
+    }
+    if (!js::UseInternalJobQueues(cx) || !JS::InitSelfHostedCode(cx)) {
+        agent_milestone("selfhosted FAILED");
+        JS_DestroyContext(cx);
+        return nullptr;
+    }
+    static JSClass agent_global_class = {"global", JSCLASS_GLOBAL_FLAGS,
+                                        &JS::DefaultGlobalClassOps};
+    JS::RealmOptions options;
+    options.creationOptions().setSharedMemoryAndAtomicsEnabled(true);
+    JS::RootedObject global(
+        cx, JS_NewGlobalObject(cx, &agent_global_class, nullptr, JS::FireOnNewGlobalHook, options));
+    if (!global) {
+        agent_milestone("global FAILED");
+        JS_DestroyContext(cx);
+        return nullptr;
+    }
+    {
+        JSAutoRealm ar(cx, global);
+        if (!JS::InitRealmStandardClasses(cx) || !install_builtins(cx, global) ||
+            !install_agent_child(cx, global)) {
+            agent_milestone("realm FAILED");
+            JS_DestroyContext(cx);
+            return nullptr;
+        }
+        JS::CompileOptions opts(cx);
+        opts.setFileAndLine("<agent>", 1);
+        JS::SourceText<mozilla::Utf8Unit> buf;
+        if (buf.init(cx, start->src.data(), start->src.size(), JS::SourceOwnership::Borrowed)) {
+            JS::RootedValue rval(cx);
+            if (JS::Evaluate(cx, opts, buf, &rval)) {
+                js::RunJobs(cx);
+            } else {
+                /* Surface the pending exception's message — "evaluate FAILED"
+                 * alone names no cause. */
+                std::string msg = "evaluate FAILED: ";
+                JS::RootedValue exc(cx);
+                if (JS_GetPendingException(cx, &exc)) {
+                    JS_ClearPendingException(cx);
+                    JS::RootedString str(cx, JS::ToString(cx, exc));
+                    if (str) {
+                        JS::UniqueChars utf8 = JS_EncodeStringToUTF8(cx, str);
+                        if (utf8) {
+                            msg += utf8.get();
+                        }
+                    }
+                }
+                agent_milestone(msg.c_str());
+            }
+        } else {
+            agent_milestone("source-init FAILED");
+        }
+        JS_ClearPendingException(cx);
+    }
+    JS_DestroyContext(cx);
+    return nullptr;
+}
+
+static bool agent_start(JSContext *cx, unsigned argc, JS::Value *vp) {
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    JS::RootedString str(cx, JS::ToString(cx, args.get(0)));
+    if (!str) {
+        return false;
+    }
+    JS::UniqueChars utf8 = JS_EncodeStringToUTF8(cx, str);
+    if (!utf8) {
+        return false;
+    }
+    auto *start = new AgentStart{std::string(utf8.get())};
+
+    pthread_t tid;
+    if (pthread_create(&tid, nullptr, agent_thread_main, start) != 0) {
+        delete start;
+        JS_ReportErrorASCII(cx, "$262.agent.start: could not spawn an agent");
+        return false;
+    }
+    pthread_detach(tid);
+    args.rval().setUndefined();
+    return true;
+}
+
+/* Parent side of $262.agent. */
+static bool install_agent_parent(JSContext *cx, JS::HandleObject hooks) {
+    JS::RootedObject agent(cx, JS_NewPlainObject(cx));
+    if (!agent) {
+        return false;
+    }
+    if (!JS_DefineFunction(cx, agent, "start", agent_start, 1, 0) ||
+        !JS_DefineFunction(cx, agent, "broadcast", agent_broadcast, 2, 0) ||
+        !JS_DefineFunction(cx, agent, "getReport", agent_get_report, 0, 0) ||
+        !JS_DefineFunction(cx, agent, "sleep", agent_sleep, 1, 0) ||
+        !JS_DefineFunction(cx, agent, "monotonicNow", agent_monotonic_now, 0, 0)) {
+        return false;
+    }
+    JS::RootedValue agentVal(cx, JS::ObjectValue(*agent));
+    return JS_DefineProperty(cx, hooks, "agent", agentVal, JSPROP_ENUMERATE);
+}
+
+#endif /* SPIDERMONKEY_WASM_THREADS */
+
 static JSObject *install_test262(JSContext *cx, JS::HandleObject global) {
     JS::RootedObject hooks(cx, JS_NewPlainObject(cx));
     if (!hooks) {
@@ -756,6 +1105,13 @@ static JSObject *install_test262(JSContext *cx, JS::HandleObject global) {
     if (!JS_DefineProperty(cx, hooks, "IsHTMLDDA", ddaVal, JSPROP_ENUMERATE)) {
         return nullptr;
     }
+#ifdef SPIDERMONKEY_WASM_THREADS
+    /* Threads builds also get $262.agent: real agents on real threads (which
+     * become goroutines under wasm2go). */
+    if (!install_agent_parent(cx, hooks)) {
+        return nullptr;
+    }
+#endif
     JS::RootedValue hooksVal(cx, JS::ObjectValue(*hooks));
     if (!JS_DefineProperty(cx, global, "$262", hooksVal, JSPROP_ENUMERATE)) {
         return nullptr;

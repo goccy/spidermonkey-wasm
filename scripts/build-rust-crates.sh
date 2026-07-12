@@ -25,7 +25,14 @@ fi
 CHANNEL=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' "$toolchain_file")
 : "${CHANNEL:?could not parse channel from $toolchain_file}"
 
-TARGET=wasm32-wasip1
+# A threads build links against a SHARED memory, and wasm-ld rejects any object
+# that lacks the atomics/bulk-memory features — including Rust's. The
+# wasm32-wasip1-threads target ships a prebuilt std that has them.
+if [[ -n ${SPIDERMONKEY_THREADS:-} ]]; then
+    TARGET=wasm32-wasip1-threads
+else
+    TARGET=wasm32-wasip1
+fi
 
 if command -v rustup >/dev/null; then
     run_cargo() { rustup run "$CHANNEL" cargo "$@"; }
@@ -33,6 +40,9 @@ if command -v rustup >/dev/null; then
         echo "[build-rust-crates] installing Rust $CHANNEL ($TARGET)"
         rustup toolchain install "$CHANNEL" --profile minimal --target "$TARGET"
     fi
+    # The toolchain may predate this TARGET (a threads build on a toolchain
+    # installed for the plain one); target add is idempotent, so just ensure it.
+    rustup target add --toolchain "$CHANNEL" "$TARGET"
 else
     # No rustup: fall back to whatever cargo is on PATH and let it fail loudly if
     # the wasm target's std is missing.

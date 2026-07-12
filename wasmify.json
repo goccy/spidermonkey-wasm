@@ -76,6 +76,8 @@
     ],
     "GoPackage": "github.com/goccy/go-spidermonkey;spidermonkey",
     "Wasm2GoImportPath": "github.com/goccy/spidermonkeywasm2go",
+    "HostThreads": true,
+    "MaxMemoryPages": 4096,
     "StackSize": 8388608,
     "ExportFunctions": [
       "js_new",
@@ -92,7 +94,7 @@
   "wasm_build": {
     "prebuilt_archives": [
       "deps/spidermonkey/libspidermonkey.a",
-      "rust/target/wasm32-wasip1/release/libspidermonkey_rust.a"
+      "deps/spidermonkey/libjsrust.a"
     ],
     "extra_cxxflags": [
       "-std=gnu++20",
@@ -100,11 +102,10 @@
       "-fno-exceptions",
       "-fno-sized-deallocation",
       "-fno-aligned-new",
-      "-mthread-model",
-      "single",
       "-Wno-invalid-offsetof",
       "-Wno-unknown-warning-option",
-      "-Wno-unused-result"
+      "-Wno-unused-result",
+      "-DSPIDERMONKEY_WASM_THREADS"
     ],
     "bridge_extra_includes": [
       "deps/spidermonkey/include"
@@ -116,7 +117,7 @@
   },
   "phases": {
     "gen-proto": {
-      "completed_at": "2026-07-12T01:31:36Z",
+      "completed_at": "2026-07-12T12:03:24Z",
       "upstream_commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
       "output_files": [
         "proto/spidermonkey.proto",
@@ -126,7 +127,7 @@
       ]
     },
     "parse-headers": {
-      "completed_at": "2026-07-12T01:31:36Z",
+      "completed_at": "2026-07-12T12:03:24Z",
       "upstream_commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
       "output_files": [
         "api-spec.json"
