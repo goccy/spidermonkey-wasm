@@ -130,12 +130,15 @@ mkdir -p "$(dirname "$MOZCONFIG")"
 # instead of -mthread-model single, so several JS agents (each its own
 # JSContext) can run concurrently — which is what test262's $262.agent needs
 # and what wasm2go's goroutine-backed wasi_thread_spawn can actually host.
-THREADS_TARGET=wasm32-wasi
+# There is no --enable-threadsafe knob in modern SpiderMonkey (it was removed
+# long ago; the engine is threadsafe by construction). What decides whether the
+# wasi build gets real threads is the TOOLCHAIN: compiling against wasi-sdk's
+# wasm32-wasi-threads sysroot with -pthread gives it pthreads, TLS and atomics,
+# which is what js/src/threading/posix and mozglue's real (non-noop) mutexes
+# need. So the threads build differs only in the flags mach_build passes.
 THREADS_MOZOPTS=""
 if [[ -n ${SPIDERMONKEY_THREADS:-} ]]; then
-    echo "[engine] threads build (wasm32-wasi-threads)"
-    THREADS_TARGET=wasm32-wasi-threads
-    THREADS_MOZOPTS="ac_add_options --enable-threadsafe"
+    echo "[engine] threads build (wasm32-wasi-threads sysroot, -pthread)"
 fi
 
 cat > "$MOZCONFIG" <<EOF
