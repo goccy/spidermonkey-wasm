@@ -218,6 +218,12 @@ int main() {
         std::printf("     %s\n", r.c_str());
         check(contains(r, "wait:timed-out") || contains(r, "threw:TypeError"),
               "Atomics.wait with zero timeout returns or throws, never hangs");
+        // 64-bit atomics must WORK, not crash: the upstream feeling-lucky
+        // arch allowlist predates wasm32 and MOZ_CRASHed the instance here
+        // (a one-line guest-JS DoS) before the engine patch.
+        r = js_eval(h, "Atomics.add(new BigInt64Array(new SharedArrayBuffer(16)), 0, 41n)"
+                       " + ',' + Atomics.load(new BigInt64Array(new ArrayBuffer(16)), 0)");
+        check(contains(r, "\"result\":\"0,0\""), "64-bit Atomics work instead of crashing");
     }
 
     // --- interrupt: infinite loop -----------------------------------------
