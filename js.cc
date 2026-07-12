@@ -708,6 +708,10 @@ static bool test262_create_realm(JSContext *cx, unsigned argc, JS::Value *vp) {
      * expects of $262.createRealm(). */
     JS::RootedObject current(cx, JS::CurrentGlobalOrNull(cx));
     options.creationOptions().setExistingCompartment(current);
+    /* Child realms get the same SharedArrayBuffer/Atomics surface as the
+     * primary realm (js_new); without this, cross-realm SAB tests see the
+     * constructor missing on the child global. */
+    options.creationOptions().setSharedMemoryAndAtomicsEnabled(true);
     JS::RootedObject newGlobal(
         cx, JS_NewGlobalObject(cx, &global_class, nullptr, JS::FireOnNewGlobalHook, options));
     if (!newGlobal) {
