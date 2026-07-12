@@ -8,10 +8,10 @@
  *
  * It is a C++ header (compiled into the wasmify bridge as C++): string OUTPUTS
  * use `std::string`, matching the bridge generator's string-output handling, and
- * string INPUTS use `const std::string&` — length-aware, so a script containing
- * an embedded NUL byte (legal in JS source, e.g. inside a string literal)
- * crosses the bridge intact instead of being truncated at the first NUL the way
- * a `const char*`/strlen surface would be. The runtime handle is an opaque
+ * string INPUTS use `const char*` (the bridge passes `.c_str()`) plus an
+ * EXPLICIT length parameter — never strlen — so a script containing an
+ * embedded NUL byte (legal in JS source, e.g. inside a string literal)
+ * crosses the bridge intact. The runtime handle is an opaque
  * integer token (uint64), which keeps the generator unambiguous (a
  * pointer-to-opaque-struct parameter is otherwise misread as an output param)
  * and is the conventional FFI handle idiom.
@@ -70,7 +70,7 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes);
  * A single JSON string return is used because the bridge generator surfaces
  * only one response value to Go; bundling the outputs keeps one round-trip and
  * one atomic result. The Go wrapper unmarshals it. */
-std::string js_eval(uint64_t h, const std::string &src);
+std::string js_eval(uint64_t h, const char *src, uint32_t src_len);
 
 /* Destroy the runtime (JS_DestroyContext). JS_ShutDown runs at process
  * teardown, not here, so the handle is fully torn down but the process stays
