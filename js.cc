@@ -553,8 +553,10 @@ static bool load_imported_module(JSContext *cx, JS::Handle<JSScript *> referrer,
                                            /* usePromise = */ false);
 }
 
-std::string js_module_register(uint64_t h, const std::string &specifier,
-                               const std::string &src) {
+std::string js_module_register(uint64_t h, const char *specifier_p, uint32_t specifier_len,
+                               const char *src_p, uint32_t src_len) {
+    const std::string specifier(specifier_p ? specifier_p : "", specifier_p ? specifier_len : 0);
+    const std::string src(src_p ? src_p : "", src_p ? src_len : 0);
     if (!g_cx || h == 0) {
         g_stdout.clear();
         g_stderr.clear();
@@ -570,8 +572,10 @@ std::string js_module_register(uint64_t h, const std::string &specifier,
     return make_result(true, "registered", "");
 }
 
-std::string js_eval_module(uint64_t h, const std::string &specifier,
-                           const std::string &src) {
+std::string js_eval_module(uint64_t h, const char *specifier_p, uint32_t specifier_len,
+                           const char *src_p, uint32_t src_len) {
+    const std::string specifier(specifier_p ? specifier_p : "", specifier_p ? specifier_len : 0);
+    const std::string src(src_p ? src_p : "", src_p ? src_len : 0);
     if (!g_cx || h == 0) {
         g_stdout.clear();
         g_stderr.clear();
@@ -806,6 +810,23 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
     }
     if (native_stack_quota_bytes) {
         JS_SetNativeStackQuota(g_cx, native_stack_quota_bytes);
+#ifdef JS_HAS_MUTABLE_WASI_RECURSION_LIMIT
+        /* On wasi, SpiderMonkey bounds recursion with a depth counter, not
+         * the native-stack quota — JS_SetNativeStackQuota alone is a no-op
+         * for recursion depth. Engines built by scripts/build-engine-intl.sh
+         * carry a patch that makes the counter's ceiling per-context; scale
+         * it with the quota at upstream's own tuning ratio (350 units per
+         * 1 MiB of stack, the shell's link size), clamped between upstream's
+         * default and what the 8 MiB stack this wasm links with can carry. */
+        uint64_t depth = (uint64_t)native_stack_quota_bytes * 350 / (1u << 20);
+        if (depth < 350) {
+            depth = 350;
+        }
+        if (depth > 2800) {
+            depth = 2800;
+        }
+        JS::RootingContext::get(g_cx)->wasiRecursionDepthLimit = (uint32_t)depth;
+#endif
     }
 
     /* Promise jobs are queued and drained by us at the end of each js_eval; no
@@ -837,6 +858,12 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
     static JSClass global_class = {"global", JSCLASS_GLOBAL_FLAGS, &JS::DefaultGlobalClassOps};
 
     JS::RealmOptions options;
+    /* Expose SharedArrayBuffer + Atomics when the engine carries them (the
+     * with-intl source build does; StarlingMonkey's prebuilt is configured
+     * --disable-shared-memory and ignores this). A single agent needs no
+     * threads for them: non-blocking Atomics are ordinary operations, and a
+     * blocking wait either throws or times out per [[CanBlock]]. */
+    options.creationOptions().setSharedMemoryAndAtomicsEnabled(true);
     JS::RootedObject global(
         g_cx, JS_NewGlobalObject(g_cx, &global_class, nullptr, JS::FireOnNewGlobalHook, options));
     if (!global) {

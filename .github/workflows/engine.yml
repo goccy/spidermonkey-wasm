@@ -1,0 +1,71 @@
+# Build libspidermonkey.a from source with the Intl API (ICU) enabled and
+# smoke-test it under wasmtime. The StarlingMonkey prebuilt the normal
+# pipeline downloads is --without-intl-api; this is the path off that
+# limitation (see scripts/build-engine-intl.sh).
+#
+# Manual for now (workflow_dispatch + pushes to the feature branch). Once the
+# archive is proven, a release job can publish it and fetch-spidermonkey.sh
+# can prefer it over the StarlingMonkey artifact.
+name: Engine (Intl)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/intl-engine-build]
+
+permissions:
+  contents: read
+
+jobs:
+  build-intl-engine:
+    name: Build + smoke (wasm32-wasi, --with-intl-api)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install wasi-sdk 30
+        run: |
+          curl -fL --proto '=https' --tlsv1.2 -o /tmp/wasi-sdk.tar.gz \
+            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-30/wasi-sdk-30.0-x86_64-linux.tar.gz
+          sudo tar -xzf /tmp/wasi-sdk.tar.gz -C /opt
+          echo "WASI_SDK_PATH=/opt/wasi-sdk-30.0-x86_64-linux" >> "$GITHUB_ENV"
+
+      - name: Install rust 1.88 (wasm32-wasip1) + cbindgen
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+          rustup target add wasm32-wasip1
+          cargo install cbindgen --locked
+
+      - name: Install wasmtime
+        # Pinned release download: wasmtime.dev/install.sh resolves "latest"
+        # through the GitHub API, which rate-limits anonymous CI runners and
+        # then installs nothing while still exiting 0.
+        run: |
+          curl -fL --proto '=https' --tlsv1.2 -o /tmp/wasmtime.tar.xz \
+            https://github.com/bytecodealliance/wasmtime/releases/download/v27.0.0/wasmtime-v27.0.0-x86_64-linux.tar.xz
+          tar -xf /tmp/wasmtime.tar.xz -C /tmp
+          sudo install /tmp/wasmtime-v27.0.0-x86_64-linux/wasmtime /usr/local/bin/wasmtime
+          wasmtime --version
+
+      - name: Build engine with Intl
+        run: bash scripts/build-engine-intl.sh
+
+      - name: Build rust staticlib (encoding crates)
+        run: bash scripts/build-rust-crates.sh
+
+      - name: Smoke test against the Intl engine
+        run: |
+          SPIDERMONKEY_DIST=build/engine-pkg \
+          SPIDERMONKEY_WASM_EXPECT_INTL=1 \
+          bash scripts/run-smoke.sh
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: spidermonkey-static-intl-release
+          path: build/spidermonkey-static-intl-release.tar.gz
+          if-no-files-found: error

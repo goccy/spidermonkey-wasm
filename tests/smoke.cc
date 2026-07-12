@@ -35,6 +35,19 @@ static bool contains(const std::string &hay, const char *needle) {
     return hay.find(needle) != std::string::npos;
 }
 
+/* Convenience overloads: the C API takes const char* + explicit length (the
+ * wasmify bridge contract); tests call with std::string and the length rides
+ * along automatically, embedded NULs included. */
+static std::string js_eval(uint64_t h, const std::string &src) {
+    return js_eval(h, src.c_str(), (uint32_t)src.size());
+}
+static std::string js_eval_module(uint64_t h, const std::string &spec, const std::string &src) {
+    return js_eval_module(h, spec.c_str(), (uint32_t)spec.size(), src.c_str(), (uint32_t)src.size());
+}
+static std::string js_module_register(uint64_t h, const std::string &spec, const std::string &src) {
+    return js_module_register(h, spec.c_str(), (uint32_t)spec.size(), src.c_str(), (uint32_t)src.size());
+}
+
 int main() {
     // When SPIDERMONKEY_WASM_NO_INTERRUPT_DISCOVERY is set, js.cc skips locating
     // JSContext::interruptBits_ and keeps the interrupt permanently armed
@@ -89,7 +102,7 @@ int main() {
 
     // A NUL byte is a legal JS source character (here, inside a string
     // literal); the length-aware bridge must not truncate the script at it.
-    r = js_eval(h, "'a\0b'.length", 12);
+    r = js_eval(h, std::string("'a\0b'.length", 12));
     check(contains(r, "\"result\":\"3\""), "source with embedded NUL is not truncated");
 
     // --- ES modules ---------------------------------------------------------
@@ -149,6 +162,63 @@ int main() {
     r = js_eval(h, "typeof $262.IsHTMLDDA + ',' + ($262.IsHTMLDDA == null) + ',' + $262.IsHTMLDDA()");
     check(contains(r, "\"result\":\"undefined,true,null\""),
           "$262.IsHTMLDDA emulates undefined and calls to null");
+
+    // Intl availability must match how the engine archive was built:
+    // SPIDERMONKEY_WASM_EXPECT_INTL=1 for --with-intl-api builds (see
+    // scripts/build-engine-intl.sh), unset for the --without-intl-api
+    // StarlingMonkey prebuilt. Asserting both directions keeps the two
+    // archive flavors from being swapped unnoticed.
+    const bool expect_intl = std::getenv("SPIDERMONKEY_WASM_EXPECT_INTL") != nullptr;
+    r = js_eval(h, "typeof Intl");
+    check(contains(r, expect_intl ? "\"result\":\"object\"" : "\"result\":\"undefined\""),
+          expect_intl ? "Intl is present (with-intl engine)" : "Intl is absent (without-intl engine)");
+    if (expect_intl) {
+        r = js_eval(h, "new Intl.NumberFormat('ja-JP').format(1234567)");
+        std::printf("     %s\n", r.c_str());
+        check(contains(r, "1,234,567"), "Intl.NumberFormat formats with locale data");
+        r = js_eval(h, "/\\p{Script=Hiragana}/u.test('\xe3\x81\x82') ? 'prop-ok' : 'no'");
+        check(contains(r, "prop-ok"), "regexp Unicode property escapes work");
+        r = js_eval(h, "'\\u0041\\u030A'.normalize('NFC') === '\\u00C5' ? 'nfc-ok' : 'no'");
+        check(contains(r, "nfc-ok"), "String.prototype.normalize works");
+        // Informational: what else this build ships (Temporal is expected to
+        // ride along with Intl in current SpiderMonkey).
+        r = js_eval(h, "typeof Temporal + ',' + typeof Intl.Segmenter");
+        std::printf("     extras: %s\n", r.c_str());
+
+        // Temporal must WORK, not merely exist: date arithmetic exercises the
+        // calendar code, and resolving a named time zone exercises the ICU
+        // zoneinfo data compiled into the archive.
+        r = js_eval(h, "Temporal.PlainDate.from('2026-07-11').add({days: 30}).toString()");
+        check(contains(r, "2026-08-10"), "Temporal date arithmetic works");
+        r = js_eval(h,
+                    "Temporal.Instant.from('2026-07-11T00:00:00Z')"
+                    ".toZonedDateTimeISO('Asia/Tokyo').hour");
+        std::printf("     tz: %s\n", r.c_str());
+        check(contains(r, "\"result\":\"9\""), "Temporal named time zones resolve (ICU zoneinfo)");
+        r = js_eval(h, "new Intl.Segmenter('ja', {granularity: 'word'})"
+                       " && [...new Intl.Segmenter('ja', {granularity: 'word'})"
+                       ".segment('今日は良い天気')].length > 1 ? 'segmenter-ok' : 'no'");
+        check(contains(r, "segmenter-ok"), "Intl.Segmenter segments Japanese (ICU4X)");
+        // Probe only — upstream SpiderMonkey does not ship ShadowRealm either.
+        r = js_eval(h, "typeof ShadowRealm");
+        std::printf("     ShadowRealm: %s\n", r.c_str());
+
+        // Single-agent shared memory: SharedArrayBuffer and non-blocking
+        // Atomics are spec-conformant without any threads. Blocking waits are
+        // exercised with a zero timeout so neither legal outcome (immediate
+        // "timed-out" where [[CanBlock]], TypeError where not) can hang.
+        r = js_eval(h, "typeof SharedArrayBuffer + ',' + typeof Atomics");
+        std::printf("     shared: %s\n", r.c_str());
+        check(contains(r, "function,object"), "SharedArrayBuffer and Atomics exist");
+        r = js_eval(h, "const sab = new SharedArrayBuffer(8); const ia = new Int32Array(sab);"
+                       "Atomics.add(ia, 0, 41); Atomics.add(ia, 0, 1); Atomics.load(ia, 0)");
+        check(contains(r, "\"result\":\"42\""), "non-blocking Atomics work on a SharedArrayBuffer");
+        r = js_eval(h, "try { 'wait:' + Atomics.wait(new Int32Array(new SharedArrayBuffer(8)), 0, 0, 0) }"
+                       "catch (e) { 'threw:' + e.constructor.name }");
+        std::printf("     %s\n", r.c_str());
+        check(contains(r, "wait:timed-out") || contains(r, "threw:TypeError"),
+              "Atomics.wait with zero timeout returns or throws, never hangs");
+    }
 
     // --- interrupt: infinite loop -----------------------------------------
     // Exactly what the Go host's Interrupter.Fire() does, in the same order:
@@ -220,6 +290,25 @@ int main() {
 
     js_close(h);
     check(true, "js_close");
+
+    // --- scaled recursion ceiling (source-built engines only) ---------------
+    // Engines from scripts/build-engine-intl.sh carry the mutable wasi
+    // recursion-limit patch: js_new scales the depth ceiling with the stack
+    // quota. 60 nested function literals exceed the upstream fixed ceiling
+    // (parse recursion hits it at ~29 with the 350-unit constant) and must
+    // parse once a 4 MiB quota raises it.
+    if (expect_intl) {
+        h = js_new(64u * 1024 * 1024, 4u * 1024 * 1024);
+        check(h != 0, "js_new with a 4 MiB quota");
+        std::string deep;
+        for (int i = 0; i < 60; i++) deep += "(function(){return ";
+        deep += "1";
+        for (int i = 0; i < 60; i++) deep += "})()";
+        r = js_eval(h, deep.c_str());
+        std::printf("     deep-nest: %.120s\n", r.c_str());
+        check(contains(r, "\"result\":\"1\""), "recursion ceiling scales with the stack quota");
+        js_close(h);
+    }
 
     std::printf("\n%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
     return failures ? 1 : 0;
