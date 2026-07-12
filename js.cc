@@ -28,6 +28,7 @@
  * embedding without its own event loop uses. */
 #include <jsfriendapi.h>
 
+#include <js/ArrayBuffer.h>
 #include <js/CompilationAndEvaluation.h>
 #include <js/Context.h>
 #include <js/Conversions.h>
@@ -37,10 +38,12 @@
 #include <js/GlobalObject.h>
 #include <js/Initialization.h>
 #include <js/Interrupt.h>
+#include <js/Modules.h>
 #include <js/Promise.h>
 #include <js/PropertyAndElement.h>
 #include <js/Realm.h>
 #include <js/RootingAPI.h>
+#include <js/ScriptPrivate.h>
 #include <js/SourceText.h>
 #include <js/Stack.h>
 #include <js/Warnings.h>
@@ -48,7 +51,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <string>
+#include <vector>
 
 /* ---- runtime state ------------------------------------------------------- */
 
@@ -376,6 +381,391 @@ static std::string take_error(JSContext *cx) {
     return msg;
 }
 
+/* ---- ES modules ----------------------------------------------------------- */
+
+/* Registered modules, keyed by specifier. Values are heap-allocated
+ * PersistentRooteds released in js_close (they must not outlive the runtime).
+ * The registry IS the loader: the host resolves specifiers to sources and
+ * registers them; the guest never does I/O (see js.h). */
+static std::map<std::string, JS::PersistentRootedObject *> *g_modules = nullptr;
+
+/* Resolve ./ and ../ in `spec` against the registry key of the importing
+ * module. Bare and absolute-looking specifiers are exact registry keys. */
+static std::string resolve_specifier(const std::string &spec, const std::string &referrer) {
+    if (spec.rfind("./", 0) != 0 && spec.rfind("../", 0) != 0) {
+        return spec;
+    }
+    std::string base;
+    size_t slash = referrer.rfind('/');
+    if (slash != std::string::npos) {
+        base = referrer.substr(0, slash);
+    }
+    /* Split base + spec into segments, dropping "." and folding "..". */
+    std::vector<std::string> segs;
+    auto push = [&segs](const std::string &s) {
+        size_t start = 0;
+        while (start <= s.size()) {
+            size_t end = s.find('/', start);
+            if (end == std::string::npos) {
+                end = s.size();
+            }
+            std::string seg = s.substr(start, end - start);
+            if (seg == "..") {
+                if (!segs.empty()) {
+                    segs.pop_back();
+                }
+            } else if (!seg.empty() && seg != ".") {
+                segs.push_back(seg);
+            }
+            start = end + 1;
+        }
+    };
+    push(base);
+    push(spec);
+    std::string out;
+    for (size_t i = 0; i < segs.size(); i++) {
+        if (i) {
+            out += '/';
+        }
+        out += segs[i];
+    }
+    return out;
+}
+
+static std::string jsstring_to_utf8(JSContext *cx, JS::HandleString str) {
+    JS::UniqueChars utf8 = JS_EncodeStringToUTF8(cx, str);
+    if (!utf8) {
+        JS_ClearPendingException(cx);
+        return std::string();
+    }
+    return std::string(utf8.get());
+}
+
+/* Compile src as a module, tag it with its specifier (the private value the
+ * load hook reads back through GetScriptPrivate), and register it. */
+static JSObject *compile_and_register_module(JSContext *cx, const std::string &specifier,
+                                             const std::string &src) {
+    JS::CompileOptions opts(cx);
+    opts.setFileAndLine(specifier.c_str(), 1);
+    JS::SourceText<mozilla::Utf8Unit> buf;
+    if (!buf.init(cx, src.data(), src.size(), JS::SourceOwnership::Borrowed)) {
+        return nullptr;
+    }
+    JS::RootedObject module(cx, JS::CompileModule(cx, opts, buf));
+    if (!module) {
+        return nullptr;
+    }
+    JS::RootedString specStr(cx, JS_NewStringCopyN(cx, specifier.data(), specifier.size()));
+    if (!specStr) {
+        return nullptr;
+    }
+    JS::SetModulePrivate(module, JS::StringValue(specStr));
+
+    if (!g_modules) {
+        g_modules = new std::map<std::string, JS::PersistentRootedObject *>();
+    }
+    auto it = g_modules->find(specifier);
+    if (it != g_modules->end()) {
+        delete it->second;
+        g_modules->erase(it);
+    }
+    (*g_modules)[specifier] = new JS::PersistentRootedObject(cx, module);
+    return module;
+}
+
+/* Look up the module a request resolves to, or report (and leave pending) a
+ * "module not registered" error. */
+static JSObject *lookup_module(JSContext *cx, JS::HandleObject moduleRequest,
+                               JS::Handle<JSScript *> referrer) {
+    JS::RootedString specStr(cx, JS::GetModuleRequestSpecifier(cx, moduleRequest));
+    if (!specStr) {
+        return nullptr;
+    }
+    std::string spec = jsstring_to_utf8(cx, specStr);
+    std::string ref;
+    if (referrer) {
+        JS::RootedValue priv(cx, JS::GetScriptPrivate(referrer));
+        if (priv.isString()) {
+            JS::RootedString refStr(cx, priv.toString());
+            ref = jsstring_to_utf8(cx, refStr);
+        }
+    }
+    std::string resolved = resolve_specifier(spec, ref);
+    if (g_modules) {
+        auto it = g_modules->find(resolved);
+        if (it != g_modules->end()) {
+            return it->second->get();
+        }
+    }
+    JS_ReportErrorUTF8(cx, "module not registered: %s", resolved.c_str());
+    return nullptr;
+}
+
+static bool load_module_resolved(JSContext *cx, JS::Handle<JS::Value> hostDefined) {
+    (void)cx;
+    (void)hostDefined;
+    return true;
+}
+
+static bool load_module_rejected(JSContext *cx, JS::Handle<JS::Value> hostDefined,
+                                 JS::Handle<JS::Value> error) {
+    (void)hostDefined;
+    /* Re-raise so the caller's take_error sees the real reason. */
+    JS_SetPendingException(cx, error);
+    return true;
+}
+
+/* HostLoadImportedModule: serves BOTH static imports (during
+ * LoadRequestedModules) and dynamic import() (payload is the promise). Mirrors
+ * js/src/shell/ModuleLoader.cpp, with the filesystem replaced by the registry. */
+static bool load_imported_module(JSContext *cx, JS::Handle<JSScript *> referrer,
+                                 JS::HandleObject moduleRequest,
+                                 JS::HandleValue hostDefined, JS::HandleValue payload,
+                                 uint32_t lineNumber, JS::ColumnNumberOneOrigin columnNumber) {
+    (void)hostDefined;
+    (void)lineNumber;
+    (void)columnNumber;
+
+    JS::RootedObject payloadObj(cx, payload.isObject() ? &payload.toObject() : nullptr);
+    const bool dynamic = payloadObj && JS::IsPromiseObject(payloadObj);
+
+    JS::RootedObject module(cx, lookup_module(cx, moduleRequest, referrer));
+    if (!module) {
+        if (dynamic) {
+            return JS::FinishLoadingImportedModuleFailedWithPendingException(cx, payload);
+        }
+        return false; /* pending exception; the engine runs the failure path */
+    }
+
+    if (dynamic) {
+        /* A dynamically imported module's own dependency graph has not been
+         * loaded yet; kick that off before handing the module back. */
+        JS::RootedValue hd(cx, JS::ObjectValue(*module));
+        if (!JS::LoadRequestedModules(cx, module, hd, load_module_resolved,
+                                      load_module_rejected) ||
+            JS_IsExceptionPending(cx)) {
+            return JS::FinishLoadingImportedModuleFailedWithPendingException(cx, payload);
+        }
+        return JS::FinishLoadingImportedModule(cx, nullptr, moduleRequest, payload, module,
+                                               /* usePromise = */ false);
+    }
+    return JS::FinishLoadingImportedModule(cx, referrer, moduleRequest, payload, module,
+                                           /* usePromise = */ false);
+}
+
+std::string js_module_register(uint64_t h, const std::string &specifier,
+                               const std::string &src) {
+    if (!g_cx || h == 0) {
+        g_stdout.clear();
+        g_stderr.clear();
+        return make_result(false, "", "no runtime");
+    }
+    g_stdout.clear();
+    g_stderr.clear();
+    JS::RootedObject global(g_cx, g_global->get());
+    JSAutoRealm ar(g_cx, global);
+    if (!compile_and_register_module(g_cx, specifier, src)) {
+        return make_result(false, "", take_error(g_cx));
+    }
+    return make_result(true, "registered", "");
+}
+
+std::string js_eval_module(uint64_t h, const std::string &specifier,
+                           const std::string &src) {
+    if (!g_cx || h == 0) {
+        g_stdout.clear();
+        g_stderr.clear();
+        return make_result(false, "", "no runtime");
+    }
+    g_stdout.clear();
+    g_stderr.clear();
+    JS::RootedObject global(g_cx, g_global->get());
+    JSAutoRealm ar(g_cx, global);
+    if (g_bits_addr == nullptr) {
+        JS_RequestInterruptCallback(g_cx);
+    }
+
+    JS::RootedObject module(g_cx, compile_and_register_module(g_cx, specifier, src));
+    if (!module) {
+        return make_result(false, "", take_error(g_cx));
+    }
+    JS::RootedValue hd(g_cx, JS::ObjectValue(*module));
+    if (!JS::LoadRequestedModules(g_cx, module, hd, load_module_resolved,
+                                  load_module_rejected) ||
+        JS_IsExceptionPending(g_cx)) {
+        return make_result(false, "", take_error(g_cx));
+    }
+    if (!JS::ModuleLink(g_cx, module)) {
+        return make_result(false, "", take_error(g_cx));
+    }
+    JS::RootedValue rval(g_cx);
+    if (!JS::ModuleEvaluate(g_cx, module, &rval)) {
+        return make_result(false, "", take_error(g_cx));
+    }
+    js::RunJobs(g_cx);
+    if (JS_IsExceptionPending(g_cx)) {
+        return make_result(false, "", take_error(g_cx));
+    }
+
+    /* With top-level await the result is the evaluation promise; report by its
+     * settled state. No timers exist, so a still-pending promise can never
+     * settle: that is an error, not something to wait on. */
+    if (rval.isObject()) {
+        JS::RootedObject promise(g_cx, &rval.toObject());
+        if (JS::IsPromiseObject(promise)) {
+            switch (JS::GetPromiseState(promise)) {
+            case JS::PromiseState::Fulfilled:
+                return make_result(true, "undefined", "");
+            case JS::PromiseState::Rejected: {
+                JS::RootedValue reason(g_cx, JS::GetPromiseResult(promise));
+                JS_SetPendingException(g_cx, reason);
+                return make_result(false, "", take_error(g_cx));
+            }
+            case JS::PromiseState::Pending:
+                return make_result(false, "",
+                                   "module evaluation did not settle "
+                                   "(top-level await on something that never resolves)");
+            }
+        }
+    }
+    return make_result(true, "undefined", "");
+}
+
+/* ---- $262 test hooks ------------------------------------------------------ */
+
+static bool test262_gc(JSContext *cx, unsigned argc, JS::Value *vp) {
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    JS_GC(cx);
+    args.rval().setUndefined();
+    return true;
+}
+
+static bool test262_detach_array_buffer(JSContext *cx, unsigned argc, JS::Value *vp) {
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    if (!args.get(0).isObject()) {
+        JS_ReportErrorASCII(cx, "detachArrayBuffer: argument must be an ArrayBuffer");
+        return false;
+    }
+    JS::RootedObject obj(cx, &args[0].toObject());
+    if (!JS::DetachArrayBuffer(cx, obj)) {
+        return false;
+    }
+    args.rval().setUndefined();
+    return true;
+}
+
+static bool test262_eval_script(JSContext *cx, unsigned argc, JS::Value *vp) {
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    JS::RootedString str(cx, JS::ToString(cx, args.get(0)));
+    if (!str) {
+        return false;
+    }
+    std::string src = jsstring_to_utf8(cx, str);
+    JS::CompileOptions opts(cx);
+    opts.setFileAndLine("<evalScript>", 1);
+    JS::SourceText<mozilla::Utf8Unit> buf;
+    if (!buf.init(cx, src.data(), src.size(), JS::SourceOwnership::Borrowed)) {
+        return false;
+    }
+    /* Evaluates in the realm this $262's function was created in: entering the
+     * call entered that realm, which is exactly test262's cross-realm usage
+     * ($262.createRealm().evalScript(...) runs in the child realm). */
+    return JS::Evaluate(cx, opts, buf, args.rval());
+}
+
+/* [[IsHTMLDDA]]: an object that emulates undefined and yields null when
+ * called, per test262's host-defined `IsHTMLDDA` requirement. */
+static bool is_htmldda_call(JSContext *cx, unsigned argc, JS::Value *vp) {
+    (void)cx;
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    args.rval().setNull();
+    return true;
+}
+
+static const JSClassOps is_htmldda_ops = {
+    .call = is_htmldda_call,
+};
+
+static const JSClass is_htmldda_class = {
+    "IsHTMLDDA",
+    JSCLASS_EMULATES_UNDEFINED,
+    &is_htmldda_ops,
+};
+
+static JSObject *install_test262(JSContext *cx, JS::HandleObject global);
+
+static bool test262_create_realm(JSContext *cx, unsigned argc, JS::Value *vp) {
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+    static JSClass global_class = {"global", JSCLASS_GLOBAL_FLAGS, &JS::DefaultGlobalClassOps};
+    JS::RealmOptions options;
+    /* Same-compartment realm: objects flow between parent and child directly,
+     * no cross-compartment wrappers, which is what test262 harness code
+     * expects of $262.createRealm(). */
+    JS::RootedObject current(cx, JS::CurrentGlobalOrNull(cx));
+    options.creationOptions().setExistingCompartment(current);
+    JS::RootedObject newGlobal(
+        cx, JS_NewGlobalObject(cx, &global_class, nullptr, JS::FireOnNewGlobalHook, options));
+    if (!newGlobal) {
+        return false;
+    }
+    JS::RootedObject childHooks(cx);
+    {
+        JSAutoRealm ar(cx, newGlobal);
+        if (!JS::InitRealmStandardClasses(cx) || !install_builtins(cx, newGlobal)) {
+            return false;
+        }
+        childHooks = install_test262(cx, newGlobal);
+        if (!childHooks) {
+            return false;
+        }
+    }
+    args.rval().setObject(*childHooks);
+    return true;
+}
+
+/* Build the $262 object for `global` and define it there. Returns it. */
+static JSObject *install_test262(JSContext *cx, JS::HandleObject global) {
+    JS::RootedObject hooks(cx, JS_NewPlainObject(cx));
+    if (!hooks) {
+        return nullptr;
+    }
+    if (!JS_DefineFunction(cx, hooks, "createRealm", test262_create_realm, 0, 0) ||
+        !JS_DefineFunction(cx, hooks, "detachArrayBuffer", test262_detach_array_buffer, 1, 0) ||
+        !JS_DefineFunction(cx, hooks, "evalScript", test262_eval_script, 1, 0) ||
+        !JS_DefineFunction(cx, hooks, "gc", test262_gc, 0, 0)) {
+        return nullptr;
+    }
+    JS::RootedValue globalVal(cx, JS::ObjectValue(*global));
+    if (!JS_DefineProperty(cx, hooks, "global", globalVal, JSPROP_ENUMERATE)) {
+        return nullptr;
+    }
+    JS::RootedObject dda(cx, JS_NewObject(cx, &is_htmldda_class));
+    if (!dda) {
+        return nullptr;
+    }
+    JS::RootedValue ddaVal(cx, JS::ObjectValue(*dda));
+    if (!JS_DefineProperty(cx, hooks, "IsHTMLDDA", ddaVal, JSPROP_ENUMERATE)) {
+        return nullptr;
+    }
+    JS::RootedValue hooksVal(cx, JS::ObjectValue(*hooks));
+    if (!JS_DefineProperty(cx, global, "$262", hooksVal, JSPROP_ENUMERATE)) {
+        return nullptr;
+    }
+    return hooks;
+}
+
+void js_install_test262_hooks(uint64_t h) {
+    if (!g_cx || h == 0) {
+        return;
+    }
+    JS::RootedObject global(g_cx, g_global->get());
+    JSAutoRealm ar(g_cx, global);
+    if (!install_test262(g_cx, global)) {
+        JS_ClearPendingException(g_cx);
+    }
+}
+
 /* ---- public API (js.h) --------------------------------------------------- */
 
 uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
@@ -433,6 +823,10 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
     }
 
     JS::SetWarningReporter(g_cx, warning_reporter);
+
+    /* Module loading is registry-backed (see js.h): the hook serves both
+     * static imports and dynamic import() from what the host registered. */
+    JS::SetModuleLoadHook(JS_GetRuntime(g_cx), load_imported_module);
 
     if (!JS_AddInterruptCallback(g_cx, interrupt_cb)) {
         JS_DestroyContext(g_cx);
@@ -525,7 +919,14 @@ void js_close(uint64_t h) {
     if (!g_cx || h == 0) {
         return;
     }
-    /* The persistent root must be released while its runtime is still alive. */
+    /* Persistent roots must be released while their runtime is still alive. */
+    if (g_modules) {
+        for (auto &entry : *g_modules) {
+            delete entry.second;
+        }
+        delete g_modules;
+        g_modules = nullptr;
+    }
     delete g_global;
     g_global = nullptr;
     JS_DestroyContext(g_cx);

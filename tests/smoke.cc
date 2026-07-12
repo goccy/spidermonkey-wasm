@@ -92,6 +92,64 @@ int main() {
     r = js_eval(h, "'a\0b'.length", 12);
     check(contains(r, "\"result\":\"3\""), "source with embedded NUL is not truncated");
 
+    // --- ES modules ---------------------------------------------------------
+    // Registry-backed loading: the host registers sources, imports resolve
+    // against the registry (exact match + ./ and ../ against the referrer).
+    r = js_eval_module(h, "bare.js", "globalThis.mod0 = 'bare';");
+    check(contains(r, "\"ok\":true"), "module with no imports evaluates");
+    r = js_eval(h, "mod0");
+    check(contains(r, "\"result\":\"bare\""), "module side effects reach the global");
+
+    r = js_module_register(h, "lib/dep.js", "export const dep = 'dep-ok';");
+    check(contains(r, "\"ok\":true"), "module registers");
+    r = js_module_register(h, "lib/mid.js",
+                           "import { dep } from './dep.js'; export const mid = dep + '+mid';");
+    check(contains(r, "\"ok\":true"), "module with relative import registers");
+    r = js_eval_module(h, "main.js",
+                       "import { mid } from './lib/mid.js'; globalThis.mod1 = mid;");
+    check(contains(r, "\"ok\":true"), "static import graph links and evaluates");
+    r = js_eval(h, "mod1");
+    check(contains(r, "\"result\":\"dep-ok+mid\""), "transitive relative imports resolve");
+
+    r = js_eval_module(h, "missing.js", "import x from './nowhere.js';");
+    check(contains(r, "\"ok\":false") && contains(r, "module not registered: nowhere.js"),
+          "unregistered import fails with the specifier named");
+
+    // Dynamic import resolves from the same registry; microtasks drain before
+    // js_eval_module returns, so the .then has run.
+    r = js_eval_module(h, "dyn.js",
+                       "globalThis.mod2 = 'pending';"
+                       "import('./lib/dep.js').then(ns => { globalThis.mod2 = ns.dep; },"
+                       "                             e => { globalThis.mod2 = 'rejected:' + e; });");
+    check(contains(r, "\"ok\":true"), "dynamic import evaluates");
+    r = js_eval(h, "mod2");
+    check(contains(r, "\"result\":\"dep-ok\""), "dynamic import resolved from the registry");
+
+    // Top-level await over an already-resolved promise completes synchronously
+    // (the job queue drains before returning).
+    r = js_eval_module(h, "tla.js",
+                       "const v = await Promise.resolve('tla-ok'); globalThis.mod3 = v;");
+    check(contains(r, "\"ok\":true"), "top-level await module settles");
+    r = js_eval(h, "mod3");
+    check(contains(r, "\"result\":\"tla-ok\""), "top-level await value observed");
+
+    // --- $262 test hooks ----------------------------------------------------
+    js_install_test262_hooks(h);
+    r = js_eval(h, "typeof $262 + ',' + typeof $262.createRealm + ',' + typeof $262.gc");
+    check(contains(r, "object,function,function"), "$262 installed");
+    r = js_eval(h, "$262.gc(); $262.evalScript('6 * 7')");
+    check(contains(r, "\"result\":\"42\""), "$262.evalScript evaluates in-realm");
+    r = js_eval(h, "const ab = new ArrayBuffer(16); $262.detachArrayBuffer(ab); ab.byteLength");
+    check(contains(r, "\"result\":\"0\""), "$262.detachArrayBuffer detaches");
+    r = js_eval(h, "const realm = $262.createRealm();"
+                   "realm.evalScript('var inChild = 123');"
+                   "realm.global.inChild + ',' + typeof globalThis.inChild");
+    check(contains(r, "\"result\":\"123,undefined\""),
+          "$262.createRealm isolates globals but shares objects");
+    r = js_eval(h, "typeof $262.IsHTMLDDA + ',' + ($262.IsHTMLDDA == null) + ',' + $262.IsHTMLDDA()");
+    check(contains(r, "\"result\":\"undefined,true,null\""),
+          "$262.IsHTMLDDA emulates undefined and calls to null");
+
     // --- interrupt: infinite loop -----------------------------------------
     // Exactly what the Go host's Interrupter.Fire() does, in the same order:
     // the "host asked" flag first, then the bit that trips SpiderMonkey's poll.
