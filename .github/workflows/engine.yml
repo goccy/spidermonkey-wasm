@@ -11,7 +11,7 @@ name: Engine (Intl)
 on:
   workflow_dispatch:
   push:
-    branches: [feat/intl-engine-build]
+    branches: [feat/intl-engine-build, feat/wasi-threads-engine]
 
 permissions:
   contents: read
