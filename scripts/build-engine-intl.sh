@@ -95,6 +95,22 @@ grep -q 'elif target.os != "WASI":' "$f" || {
     exit 1
 }
 
+# 64-bit Atomics: AtomicOperations-feeling-lucky-gcc.h gates
+# HAS_64BIT_ATOMICS behind an architecture allowlist that predates wasm32,
+# so Atomics on a BigInt64Array MOZ_CRASHes the whole instance — a one-line
+# guest-JS DoS against the sandbox. With -mthread-model single the 64-bit
+# __atomic builtins lower to plain i64 operations, which are trivially
+# correct for a single agent, so declaring support is sound. (Upstreamable:
+# the same holds for any wasm32 build.)
+f=$SRC/js/src/jit/shared/AtomicOperations-feeling-lucky-gcc.h
+if ! grep -q '__wasm32__' "$f"; then
+    perl -0pi -e 's/#if defined\(__riscv\) && __riscv_xlen == 64\n#  define HAS_64BIT_ATOMICS\n#  define HAS_64BIT_LOCKFREE\n#endif/#if defined(__riscv) \&\& __riscv_xlen == 64\n#  define HAS_64BIT_ATOMICS\n#  define HAS_64BIT_LOCKFREE\n#endif\n\n#if defined(__wasm32__)\n#  define HAS_64BIT_ATOMICS\n#  define HAS_64BIT_LOCKFREE\n#endif/' "$f"
+fi
+grep -q '__wasm32__' "$f" || {
+    echo "error: wasm32 64-bit-atomics patch no longer applies to $f" >&2
+    exit 1
+}
+
 # --- mozconfig -----------------------------------------------------------------
 # StarlingMonkey's release mozconfig, verbatim, with ONE change: no
 # --without-intl-api line, so the build defaults to --with-intl-api and
