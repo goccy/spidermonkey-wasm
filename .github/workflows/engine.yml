@@ -69,3 +69,37 @@ jobs:
           name: spidermonkey-static-intl-release
           path: build/spidermonkey-static-intl-release.tar.gz
           if-no-files-found: error
+
+  # Can SpiderMonkey itself be built for wasi-threads (real pthreads instead of
+  # -mthread-model single)? That is the gate on test262's $262.agent tests and
+  # on several JS agents running concurrently on wasm2go's goroutines.
+  # Informational: failure here does not block the single-agent engine above.
+  threads-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install wasi-sdk 30
+        run: |
+          curl -fL --proto '=https' --tlsv1.2 -o /tmp/wasi-sdk.tar.gz \
+            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-30/wasi-sdk-30.0-x86_64-linux.tar.gz
+          sudo tar -xzf /tmp/wasi-sdk.tar.gz -C /opt
+          echo "WASI_SDK_PATH=/opt/wasi-sdk-30.0-x86_64-linux" >> "$GITHUB_ENV"
+      - name: Install rust 1.88 (wasm32-wasip1) + cbindgen
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+          rustup target add wasm32-wasip1
+          cargo install cbindgen --locked
+      - name: Build the engine for wasi-threads
+        env:
+          SPIDERMONKEY_THREADS: "1"
+        run: bash scripts/build-engine-intl.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-intl-threads
+          path: build/spidermonkey-static-intl-release.tar.gz
+          if-no-files-found: error

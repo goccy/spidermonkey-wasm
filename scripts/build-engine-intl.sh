@@ -126,9 +126,22 @@ mkdir -p "$(dirname "$MOZCONFIG")"
 # behind `if not CONFIG["JS_DISABLE_SHELL"]` (js/src/moz.build), and a
 # with-intl engine cannot link without it. The shell binary itself is
 # discarded; it just drags jsrust into the build.
+# SPIDERMONKEY_THREADS=1 builds the engine for wasi-threads: real pthreads
+# instead of -mthread-model single, so several JS agents (each its own
+# JSContext) can run concurrently — which is what test262's $262.agent needs
+# and what wasm2go's goroutine-backed wasi_thread_spawn can actually host.
+THREADS_TARGET=wasm32-wasi
+THREADS_MOZOPTS=""
+if [[ -n ${SPIDERMONKEY_THREADS:-} ]]; then
+    echo "[engine] threads build (wasm32-wasi-threads)"
+    THREADS_TARGET=wasm32-wasi-threads
+    THREADS_MOZOPTS="ac_add_options --enable-threadsafe"
+fi
+
 cat > "$MOZCONFIG" <<EOF
 ac_add_options --enable-project=js
 ac_add_options --target=wasm32-unknown-wasi
+$THREADS_MOZOPTS
 ac_add_options --without-system-zlib
 ac_add_options --disable-jit
 ac_add_options --disable-shared-js
