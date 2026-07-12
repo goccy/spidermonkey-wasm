@@ -87,16 +87,16 @@ std::string js_eval(uint64_t h, const char *src, uint32_t src_len);
 /* Compile `src` as an ES module and register it under `specifier`. Returns the
  * usual JSON result; "ok" false carries the compile error. Re-registering a
  * specifier replaces the module (affects future lookups only). */
-std::string js_module_register(uint64_t h, const std::string &specifier,
-                               const std::string &src);
+std::string js_module_register(uint64_t h, const char *specifier, uint32_t specifier_len,
+                               const char *src, uint32_t src_len);
 
 /* Compile `src` as an ES module registered under `specifier`, load its
  * dependency graph from the registry, link, evaluate, and drain the job queue.
  * Same JSON shape as js_eval: "ok" true when the module (including top-level
  * await) evaluated to completion; "error" carries compile/link/import/runtime
  * failures, or "module not registered: X" when an import misses the registry. */
-std::string js_eval_module(uint64_t h, const std::string &specifier,
-                           const std::string &src);
+std::string js_eval_module(uint64_t h, const char *specifier, uint32_t specifier_len,
+                           const char *src, uint32_t src_len);
 
 /* Install the $262 test-support object (https://github.com/tc39/test262
  * INTERPRETING.md) on this runtime's global: createRealm (same-compartment

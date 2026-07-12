@@ -553,8 +553,10 @@ static bool load_imported_module(JSContext *cx, JS::Handle<JSScript *> referrer,
                                            /* usePromise = */ false);
 }
 
-std::string js_module_register(uint64_t h, const std::string &specifier,
-                               const std::string &src) {
+std::string js_module_register(uint64_t h, const char *specifier_p, uint32_t specifier_len,
+                               const char *src_p, uint32_t src_len) {
+    const std::string specifier(specifier_p ? specifier_p : "", specifier_p ? specifier_len : 0);
+    const std::string src(src_p ? src_p : "", src_p ? src_len : 0);
     if (!g_cx || h == 0) {
         g_stdout.clear();
         g_stderr.clear();
@@ -570,8 +572,10 @@ std::string js_module_register(uint64_t h, const std::string &specifier,
     return make_result(true, "registered", "");
 }
 
-std::string js_eval_module(uint64_t h, const std::string &specifier,
-                           const std::string &src) {
+std::string js_eval_module(uint64_t h, const char *specifier_p, uint32_t specifier_len,
+                           const char *src_p, uint32_t src_len) {
+    const std::string specifier(specifier_p ? specifier_p : "", specifier_p ? specifier_len : 0);
+    const std::string src(src_p ? src_p : "", src_p ? src_len : 0);
     if (!g_cx || h == 0) {
         g_stdout.clear();
         g_stderr.clear();

@@ -35,6 +35,20 @@ static bool contains(const std::string &hay, const char *needle) {
     return hay.find(needle) != std::string::npos;
 }
 
+/* Convenience overloads: the C API takes const char* + explicit length (the
+ * wasmify bridge contract); tests call with std::string and the length rides
+ * along automatically, embedded NULs included. */
+static std::string js_eval(uint64_t h, const std::string &src) {
+    return js_eval(h, src.c_str(), (uint32_t)src.size());
+}
+static std::string js_eval_module(uint64_t h, const std::string &spec, const std::string &src) {
+    return js_eval_module(h, spec.c_str(), (uint32_t)spec.size(), src.c_str(), (uint32_t)src.size());
+}
+static std::string js_module_register(uint64_t h, const std::string &spec, const std::string &src) {
+    return js_module_register(h, spec.c_str(), (uint32_t)spec.size(), src.c_str(), (uint32_t)src.size());
+}
+
+
 int main() {
     // When SPIDERMONKEY_WASM_NO_INTERRUPT_DISCOVERY is set, js.cc skips locating
     // JSContext::interruptBits_ and keeps the interrupt permanently armed
