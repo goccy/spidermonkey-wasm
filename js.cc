@@ -29,6 +29,7 @@
 #include <jsfriendapi.h>
 
 #include <js/ArrayBuffer.h>
+#include <js/HelperThreadAPI.h>
 #include <js/SharedArrayBuffer.h>
 #include <js/StructuredClone.h>
 #include <js/CompilationAndEvaluation.h>
@@ -262,6 +263,124 @@ static bool builtin_print_err(JSContext *cx, unsigned argc, JS::Value *vp) {
  * the ENTIRE host surface a guest script gets: no fetch, no timers, no file or
  * network access, nothing that can escape the wasm sandbox. Anything more must
  * be added deliberately, and must then be gated by the host-side policy hooks. */
+
+#ifdef SPIDERMONKEY_WASM_THREADS
+/* ---- helper-thread pool ----------------------------------------------------
+ * A threads build hands internal tasks to an EXTERNAL pool and waits on them.
+ * Each task runs on its own pthread — a goroutine under wasm2go. Registered
+ * BEFORE JS_Init: the engine decides useInternalThreadPool_ from whether a
+ * callback is already set.
+ */
+static void *helper_thread_trampoline(void *arg) {
+    JS::RunHelperThreadTask(static_cast<JS::HelperThreadTask *>(arg));
+    return nullptr;
+}
+
+static void helper_thread_dispatch(JS::HelperThreadTask *task) {
+    pthread_t tid;
+    if (pthread_create(&tid, nullptr, helper_thread_trampoline, task) != 0) {
+        JS::RunHelperThreadTask(task); /* inline: a dropped task deadlocks */
+        return;
+    }
+    pthread_detach(tid);
+}
+#endif /* SPIDERMONKEY_WASM_THREADS */
+
+/* ---- host timers -----------------------------------------------------------
+ *
+ * PROMISE work stays entirely inside the engine: js::UseInternalJobQueues
+ * installs both the internal job queue and the internal dispatch queue, and
+ * js::RunJobs drains both — cross-thread Atomics.waitAsync resolutions and
+ * their timeouts included. Do NOT also register an external
+ * DispatchToEventLoop callback: InternalJobQueue::runJobs calls
+ * OffThreadPromiseRuntimeState::internalDrain unconditionally, which then
+ * blocks on a condition variable that only the INTERNAL queue ever signals.
+ *
+ * What the engine does not supply is setTimeout, which test262's
+ * atomicsHelper.js needs — without one it installs a promise-chain busy-wait
+ * polyfill that spins inside RunJobs. So the host keeps exactly one queue: JS
+ * timers, fired from the pump loops.
+ */
+struct HostTimerQueue {
+    std::mutex mu;
+    struct Timer {
+        uint64_t due_ms;
+        JS::PersistentRootedValue *fn;
+    };
+    std::vector<Timer> timers;
+};
+static HostTimerQueue g_timers;
+
+/* The timer queue owning the CURRENT thread (agents carry their own). */
+static thread_local HostTimerQueue *t_timers = &g_timers;
+
+static uint64_t monotonic_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static bool builtin_set_timeout(JSContext *cx, unsigned argc, JS::Value *vp) {
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    if (!args.get(0).isObject() || !JS::IsCallable(&args[0].toObject())) {
+        JS_ReportErrorASCII(cx, "setTimeout: expected a function");
+        return false;
+    }
+    double ms = 0;
+    if (args.hasDefined(1) && !JS::ToNumber(cx, args.get(1), &ms)) {
+        return false;
+    }
+    if (ms < 0) {
+        ms = 0;
+    }
+    auto *fn = new JS::PersistentRootedValue(cx, args[0]);
+    {
+        std::lock_guard<std::mutex> lock(t_timers->mu);
+        t_timers->timers.push_back({monotonic_ms() + (uint64_t)ms, fn});
+    }
+    args.rval().setUndefined();
+    return true;
+}
+
+/* Fire every due timer (or drop them all on shutdown). Reports whether any
+ * callback ran. */
+static bool host_timers_run(JSContext *cx, HostTimerQueue *q, bool shutting_down) {
+    bool ran = false;
+    for (;;) {
+        JS::PersistentRootedValue *fn = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(q->mu);
+            uint64_t now = monotonic_ms();
+            for (size_t i = 0; i < q->timers.size(); i++) {
+                if (shutting_down) {
+                    delete q->timers[i].fn;
+                    q->timers.erase(q->timers.begin() + i);
+                    i--;
+                } else if (q->timers[i].due_ms <= now) {
+                    fn = q->timers[i].fn;
+                    q->timers.erase(q->timers.begin() + i);
+                    break;
+                }
+            }
+        }
+        if (!fn) {
+            return ran;
+        }
+        JS::RootedValue f(cx, fn->get());
+        delete fn;
+        JS::RootedValue rval(cx);
+        if (!JS_CallFunctionValue(cx, nullptr, f, JS::HandleValueArray::empty(), &rval)) {
+            JS_ClearPendingException(cx);
+        }
+        ran = true;
+    }
+}
+
+static bool host_timers_pending(HostTimerQueue *q) {
+    std::lock_guard<std::mutex> lock(q->mu);
+    return !q->timers.empty();
+}
+
 static bool install_builtins(JSContext *cx, JS::HandleObject global) {
     if (!JS_DefineFunction(cx, global, "print", builtin_print, 0, 0)) {
         return false;
@@ -1093,6 +1212,12 @@ static JSObject *install_test262(JSContext *cx, JS::HandleObject global) {
         !JS_DefineFunction(cx, hooks, "gc", test262_gc, 0, 0)) {
         return nullptr;
     }
+    /* A real setTimeout: the harness needs one (atomicsHelper.js otherwise
+     * installs a promise-chain busy-wait that starves the loop). Host
+     * capability — hooks only, never the sandbox surface. */
+    if (!JS_DefineFunction(cx, global, "setTimeout", builtin_set_timeout, 2, 0)) {
+        return nullptr;
+    }
     JS::RootedValue globalVal(cx, JS::ObjectValue(*global));
     if (!JS_DefineProperty(cx, hooks, "global", globalVal, JSPROP_ENUMERATE)) {
         return nullptr;
@@ -1139,6 +1264,11 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
 
     static bool inited = false;
     if (!inited) {
+#ifdef SPIDERMONKEY_WASM_THREADS
+        /* MUST precede JS_Init: the engine picks its internal thread pool
+         * from whether a dispatch callback is already set. */
+        JS::SetHelperThreadTaskCallback(helper_thread_dispatch, 8, 512 * 1024);
+#endif
         if (!JS_Init()) {
             return 0;
         }
@@ -1191,6 +1321,9 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
 
     /* Promise jobs are queued and drained by us at the end of each js_eval; no
      * timers, no event loop, so an unsettled promise cannot hang the call. */
+    /* A shell-like embedding, not a browser main thread: the main agent may
+     * block in Atomics.wait (test262 CanBlockIsTrue). */
+    JS_SetFutexCanWait(g_cx);
     if (!js::UseInternalJobQueues(g_cx)) {
         JS_DestroyContext(g_cx);
         g_cx = nullptr;
@@ -1251,6 +1384,31 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
     g_global = new JS::PersistentRootedObject(g_cx, global);
     g_interrupt = 0;
     return 1; /* opaque handle */
+}
+
+std::string js_pump_jobs(uint64_t h) {
+    if (!g_cx || h == 0) {
+        g_stdout.clear();
+        g_stderr.clear();
+        return make_result(false, "", "no runtime");
+    }
+    g_stdout.clear();
+    g_stderr.clear();
+
+    JS::RootedObject global(g_cx, g_global->get());
+    JSAutoRealm ar(g_cx, global);
+
+    bool ran = host_timers_run(g_cx, &g_timers, /* shutting_down */ false);
+    /* RunJobs drains microtasks AND the engine's internal dispatch queue —
+     * a cross-thread waitAsync resolution lands there. It blocks while an
+     * off-thread task is outstanding, which is the wait the host wants: the
+     * notifying agent, or the engine's own timeout, releases it. */
+    js::RunJobs(g_cx);
+    if (JS_IsExceptionPending(g_cx)) {
+        return make_result(false, "", take_error(g_cx));
+    }
+    bool progressed = ran || !g_stdout.empty() || !g_stderr.empty();
+    return make_result(true, progressed ? "1" : "0", "");
 }
 
 std::string js_eval(uint64_t h, const char *src, uint32_t src_len) {

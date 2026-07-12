@@ -88,7 +88,8 @@
       "js_close",
       "js_interrupt_addr",
       "js_interrupt_bits_addr",
-      "js_interrupt_bits_value"
+      "js_interrupt_bits_value",
+      "js_pump_jobs"
     ]
   },
   "wasm_build": {
@@ -117,7 +118,7 @@
   },
   "phases": {
     "gen-proto": {
-      "completed_at": "2026-07-12T12:03:24Z",
+      "completed_at": "2026-07-12T16:22:40Z",
       "upstream_commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
       "output_files": [
         "proto/spidermonkey.proto",
@@ -127,7 +128,7 @@
       ]
     },
     "parse-headers": {
-      "completed_at": "2026-07-12T12:03:24Z",
+      "completed_at": "2026-07-12T16:22:40Z",
       "upstream_commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
       "output_files": [
         "api-spec.json"

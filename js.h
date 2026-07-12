@@ -72,6 +72,15 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes);
  * one atomic result. The Go wrapper unmarshals it. */
 std::string js_eval(uint64_t h, const char *src, uint32_t src_len);
 
+/* Drain the runtime's job queue once (microtasks plus any cross-thread
+ * Dispatchables another agent has queued — Atomics.waitAsync resolutions
+ * arrive this way). Returns the same {ok, result, error} envelope as js_eval;
+ * result is "1" if the pump made progress (output was produced or a job ran),
+ * "0" if the queue was empty. stdout/stderr produced by the drained jobs is
+ * captured exactly like js_eval's. The host loops on this to run an event
+ * loop; the engine has no loop of its own. */
+std::string js_pump_jobs(uint64_t h);
+
 /* ---- ES modules ------------------------------------------------------------
  *
  * The guest cannot call out to the host mid-link, so module loading is a
