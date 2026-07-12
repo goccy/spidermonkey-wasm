@@ -39,7 +39,7 @@ permissions:
   attestations: write
 
 env:
-  WASMIFY_VERSION: v0.4.9
+  WASMIFY_VERSION: v0.4.11
 
 jobs:
   build:

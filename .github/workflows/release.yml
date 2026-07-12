@@ -37,7 +37,7 @@ permissions:
 
 env:
   # Keep in lock-step with build.yml.
-  WASMIFY_VERSION: v0.4.9
+  WASMIFY_VERSION: v0.4.11
 
 jobs:
   release:
