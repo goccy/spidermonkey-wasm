@@ -60,36 +60,36 @@ int main() {
     }
 
     // --- basic eval --------------------------------------------------------
-    std::string r = js_eval(h, "1 + 2");
+    std::string r = js_eval(h, "1 + 2", sizeof("1 + 2") - 1);
     std::printf("     %s\n", r.c_str());
     check(contains(r, "\"ok\":true") && contains(r, "\"result\":\"3\""), "eval arithmetic");
 
-    r = js_eval(h, "globalThis.x = 41; x + 1");
+    r = js_eval(h, "globalThis.x = 41; x + 1", sizeof("globalThis.x = 41; x + 1") - 1);
     check(contains(r, "\"result\":\"42\""), "eval global persists across calls");
 
-    r = js_eval(h, "print('hello'); console.error('bad'); 'done'");
+    r = js_eval(h, "print('hello'); console.error('bad'); 'done'", sizeof("print('hello'); console.error('bad'); 'done'") - 1);
     std::printf("     %s\n", r.c_str());
     check(contains(r, "\"stdout\":\"hello\\n\"") && contains(r, "\"stderr\":\"bad\\n\""),
           "print/console captured");
 
-    r = js_eval(h, "throw new Error('boom')");
+    r = js_eval(h, "throw new Error('boom')", sizeof("throw new Error('boom')") - 1);
     check(contains(r, "\"ok\":false") && contains(r, "boom"), "uncaught exception reported");
 
-    r = js_eval(h, "JSON.stringify({a:[1,2]})");
+    r = js_eval(h, "JSON.stringify({a:[1,2]})", sizeof("JSON.stringify({a:[1,2]})") - 1);
     check(contains(r, "{\\\"a\\\":[1,2]}"), "standard classes available");
 
-    r = js_eval(h, "let p = 0; Promise.resolve(7).then(v => { p = v; }); 'queued'");
+    r = js_eval(h, "let p = 0; Promise.resolve(7).then(v => { p = v; }); 'queued'", sizeof("let p = 0; Promise.resolve(7).then(v => { p = v; }); 'queued'") - 1);
     check(contains(r, "\"ok\":true"), "promise job queued");
-    r = js_eval(h, "p");
+    r = js_eval(h, "p", sizeof("p") - 1);
     check(contains(r, "\"result\":\"7\""), "promise job drained before return");
 
     // The bridge must expose no I/O surface at all.
-    r = js_eval(h, "typeof fetch + ',' + typeof setTimeout + ',' + typeof read");
+    r = js_eval(h, "typeof fetch + ',' + typeof setTimeout + ',' + typeof read", sizeof("typeof fetch + ',' + typeof setTimeout + ',' + typeof read") - 1);
     check(contains(r, "undefined,undefined,undefined"), "no fetch/setTimeout/read builtins");
 
     // A NUL byte is a legal JS source character (here, inside a string
     // literal); the length-aware bridge must not truncate the script at it.
-    r = js_eval(h, std::string("'a\0b'.length", 12));
+    r = js_eval(h, "'a\0b'.length", 12);
     check(contains(r, "\"result\":\"3\""), "source with embedded NUL is not truncated");
 
     // --- ES modules ---------------------------------------------------------
@@ -161,23 +161,23 @@ int main() {
     };
 
     fire();
-    r = js_eval(h, "while (true) {}");
+    r = js_eval(h, "while (true) {}", sizeof("while (true) {}") - 1);
     std::printf("     %s\n", r.c_str());
     check(contains(r, "\"ok\":false") && contains(r, "interrupted"), "infinite loop interrupted");
 
     // The runtime must still be usable afterwards.
-    r = js_eval(h, "1 + 1");
+    r = js_eval(h, "1 + 1", sizeof("1 + 1") - 1);
     check(contains(r, "\"result\":\"2\""), "runtime usable after interrupt");
 
     // --- interrupt is uncatchable -----------------------------------------
     // The whole security argument: guest JS must not be able to swallow it.
     fire();
-    r = js_eval(h, "try { while (true) {} } catch (e) { 'swallowed' } finally { }");
+    r = js_eval(h, "try { while (true) {} } catch (e) { 'swallowed' } finally { }", sizeof("try { while (true) {} } catch (e) { 'swallowed' } finally { }") - 1);
     std::printf("     %s\n", r.c_str());
     check(contains(r, "\"ok\":false") && !contains(r, "swallowed"),
           "interrupt is uncatchable by try/catch");
 
-    r = js_eval(h, "2 * 3");
+    r = js_eval(h, "2 * 3", sizeof("2 * 3") - 1);
     check(contains(r, "\"result\":\"6\""), "runtime usable after uncatchable interrupt");
 
     // Regression: an interrupt that fires consumes SpiderMonkey's armed state
@@ -187,18 +187,18 @@ int main() {
     // in fallback mode, so exercise it repeatedly.
     for (int i = 0; i < 3; i++) {
         fire();
-        r = js_eval(h, "while (true) {}");
+        r = js_eval(h, "while (true) {}", sizeof("while (true) {}") - 1);
         check(contains(r, "\"ok\":false") && contains(r, "interrupted"),
               "repeated interrupt still fires (re-armed)");
     }
 
     // --- an interrupt that was never requested must not fire ---------------
-    r = js_eval(h, "let n = 0; for (let i = 0; i < 3000000; i++) n += i; n > 0");
+    r = js_eval(h, "let n = 0; for (let i = 0; i < 3000000; i++) n += i; n > 0", sizeof("let n = 0; for (let i = 0; i < 3000000; i++) n += i; n > 0") - 1);
     check(contains(r, "\"ok\":true") && contains(r, "\"result\":\"true\""),
           "long loop completes when no interrupt is pending");
 
     // --- recursion is bounded, not a wasm trap -----------------------------
-    r = js_eval(h, "function f(){ return f(); } try { f() } catch (e) { 'caught:' + e.name }");
+    r = js_eval(h, "function f(){ return f(); } try { f() } catch (e) { 'caught:' + e.name }", sizeof("function f(){ return f(); } try { f() } catch (e) { 'caught:' + e.name }") - 1);
     std::printf("     %s\n", r.c_str());
     check(contains(r, "caught:InternalError") || contains(r, "too much recursion"),
           "native stack quota turns runaway recursion into a JS error");
@@ -206,9 +206,13 @@ int main() {
     // --- heap cap ----------------------------------------------------------
     // Report what was actually thrown: an assertion that merely checks the loop
     // stopped would also pass if some unrelated error ended it.
-    r = js_eval(h, "let a = [];\n"
-                   "try { for(;;) a.push(new Array(100000).fill(0)); a = null; 'never' }\n"
-                   "catch (e) { a = null; 'threw:' + String(e) }");
+    {
+        const char heapSrc[] =
+            "let a = [];\n"
+            "try { for(;;) a.push(new Array(100000).fill(0)); a = null; 'never' }\n"
+            "catch (e) { a = null; 'threw:' + String(e) }";
+        r = js_eval(h, heapSrc, sizeof(heapSrc) - 1);
+    }
     std::printf("     %s\n", r.c_str());
     check(contains(r, "out of memory") || contains(r, "allocation size overflow") ||
               (contains(r, "\"ok\":false") && contains(r, "memory")),

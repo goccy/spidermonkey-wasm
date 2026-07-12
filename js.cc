@@ -866,7 +866,7 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
     return 1; /* opaque handle */
 }
 
-std::string js_eval(uint64_t h, const std::string &src) {
+std::string js_eval(uint64_t h, const char *src, uint32_t src_len) {
     if (!g_cx || h == 0) {
         g_stdout.clear();
         g_stderr.clear();
@@ -894,9 +894,9 @@ std::string js_eval(uint64_t h, const std::string &src) {
 
     /* Length-aware on purpose: JS source may legally contain NUL bytes (inside
      * string/template literals), so the byte count comes from the std::string,
-     * never from strlen. */
+     * never from strlen: the byte count is the caller's explicit src_len. */
     JS::SourceText<mozilla::Utf8Unit> buf;
-    if (!buf.init(g_cx, src.data(), src.size(), JS::SourceOwnership::Borrowed)) {
+    if (!buf.init(g_cx, src ? src : "", src ? src_len : 0, JS::SourceOwnership::Borrowed)) {
         JS_ClearPendingException(g_cx);
         return make_result(false, "", "could not read source");
     }
