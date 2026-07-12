@@ -42,7 +42,46 @@ env:
   WASMIFY_VERSION: v0.4.11
 
 jobs:
+  # Build the with-Intl engine from source (ICU + Temporal + shared memory +
+  # the wasi patches — see scripts/build-engine-intl.sh) and hand the archive
+  # to the jobs below via SPIDERMONKEY_LOCAL_ARCHIVE.
+  engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install wasi-sdk 30
+        run: |
+          curl -fL --proto '=https' --tlsv1.2 -o /tmp/wasi-sdk.tar.gz \
+            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-30/wasi-sdk-30.0-x86_64-linux.tar.gz
+          sudo tar -xzf /tmp/wasi-sdk.tar.gz -C /opt
+          echo "WASI_SDK_PATH=/opt/wasi-sdk-30.0-x86_64-linux" >> "$GITHUB_ENV"
+      - name: Install rust 1.88 (wasm32-wasip1) + cbindgen
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+          rustup target add wasm32-wasip1
+          cargo install cbindgen --locked
+      - name: Cache engine build
+        uses: actions/cache@v4
+        with:
+          path: build/spidermonkey-static-intl-release.tar.gz
+          key: engine-intl-${{ runner.os }}-${{ hashFiles('scripts/build-engine-intl.sh', 'starlingmonkey/cmake/spidermonkey.cmake') }}
+      - name: Build engine with Intl
+        run: |
+          if [ ! -f build/spidermonkey-static-intl-release.tar.gz ]; then
+            bash scripts/build-engine-intl.sh
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-intl
+          path: build/spidermonkey-static-intl-release.tar.gz
+          if-no-files-found: error
+
   build:
+    needs: engine
     runs-on: ubuntu-latest
     steps:
       - name: Free disk space on the runner
@@ -65,6 +104,14 @@ jobs:
           # scripts/fetch-spidermonkey.sh downloads, and it carries the Rust
           # crates rust/ links against.
           submodules: recursive
+
+      - name: Fetch the with-Intl engine archive
+        uses: actions/download-artifact@v4
+        with:
+          name: engine-intl
+          path: /tmp/engine
+      - name: Point the pipeline at the local engine archive
+        run: echo "SPIDERMONKEY_LOCAL_ARCHIVE=/tmp/engine/spidermonkey-static-intl-release.tar.gz" >> "$GITHUB_ENV"
 
       - uses: actions/setup-go@v5
         with:
@@ -94,10 +141,8 @@ jobs:
       - name: Cache the prebuilt engine + Rust staticlib
         uses: actions/cache@v4
         with:
-          path: |
-            deps/spidermonkey
-            rust/target
-          key: engine-${{ runner.os }}-${{ hashFiles('starlingmonkey/cmake/spidermonkey.cmake', 'starlingmonkey/rust-toolchain.toml', 'rust/Cargo.lock') }}
+          path: rust/target
+          key: rustlib-${{ runner.os }}-${{ hashFiles('starlingmonkey/cmake/spidermonkey.cmake', 'starlingmonkey/rust-toolchain.toml', 'rust/Cargo.lock') }}
 
       - name: Run the wasmify pipeline
         # tools + deps + parse-headers + gen-proto + wasm-build + buf generate
@@ -144,11 +189,22 @@ jobs:
   # embedding layer rather than to the Go bindings. Runs both interrupt modes
   # (address discovery, and the always-armed fallback).
   smoke:
+    needs: engine
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Fetch the with-Intl engine archive
+        uses: actions/download-artifact@v4
+        with:
+          name: engine-intl
+          path: /tmp/engine
+      - name: Point the pipeline at the local engine archive
+        run: |
+          echo "SPIDERMONKEY_LOCAL_ARCHIVE=/tmp/engine/spidermonkey-static-intl-release.tar.gz" >> "$GITHUB_ENV"
+          echo "SPIDERMONKEY_WASM_EXPECT_INTL=1" >> "$GITHUB_ENV"
 
       - uses: actions/setup-go@v5
         with:
@@ -163,10 +219,8 @@ jobs:
       - name: Cache the prebuilt engine + Rust staticlib
         uses: actions/cache@v4
         with:
-          path: |
-            deps/spidermonkey
-            rust/target
-          key: engine-${{ runner.os }}-${{ hashFiles('starlingmonkey/cmake/spidermonkey.cmake', 'starlingmonkey/rust-toolchain.toml', 'rust/Cargo.lock') }}
+          path: rust/target
+          key: rustlib-${{ runner.os }}-${{ hashFiles('starlingmonkey/cmake/spidermonkey.cmake', 'starlingmonkey/rust-toolchain.toml', 'rust/Cargo.lock') }}
 
       - name: Cache the wasi-sdk toolchain
         uses: actions/cache@v4

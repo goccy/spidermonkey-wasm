@@ -50,18 +50,35 @@ url="https://github.com/bytecodealliance/starlingmonkey/releases/download/libspi
 dest=deps/spidermonkey
 stamp=$dest/.tag
 
+up_to_date=false
 if [[ -f $stamp && $(cat "$stamp") == "$SM_TAG" && -f $dest/libspidermonkey.a ]]; then
+    up_to_date=true
+    # A local (with-Intl) archive is a different flavor than the StarlingMonkey
+    # prebuilt at the same tag; jsrust presence is the flavor marker.
+    if [[ -n ${SPIDERMONKEY_LOCAL_ARCHIVE:-} && ! -f $dest/libjsrust.a ]]; then
+        up_to_date=false
+    fi
+fi
+if $up_to_date; then
     echo "[fetch-spidermonkey] up to date: $SM_TAG"
     exit 0
 fi
 
 echo "[fetch-spidermonkey] SM_TAG=$SM_TAG"
-echo "[fetch-spidermonkey] downloading $url"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-curl --fail --location --progress-bar "$url" -o "$tmp/sm.tar.gz"
+# SPIDERMONKEY_LOCAL_ARCHIVE points at a locally built engine tarball — the
+# with-Intl archive scripts/build-engine-intl.sh produces (CI hands it across
+# jobs as an artifact). When set, it replaces the StarlingMonkey download.
+if [[ -n ${SPIDERMONKEY_LOCAL_ARCHIVE:-} ]]; then
+    echo "[fetch-spidermonkey] using local archive $SPIDERMONKEY_LOCAL_ARCHIVE"
+    cp "$SPIDERMONKEY_LOCAL_ARCHIVE" "$tmp/sm.tar.gz"
+else
+    echo "[fetch-spidermonkey] downloading $url"
+    curl --fail --location --progress-bar "$url" -o "$tmp/sm.tar.gz"
+fi
 
 # The tarball's single top-level directory is spidermonkey-dist-<type>/, holding
 # libspidermonkey.a and include/. Strip it so paths are stable regardless of the
@@ -69,9 +86,15 @@ curl --fail --location --progress-bar "$url" -o "$tmp/sm.tar.gz"
 mkdir -p "$tmp/x"
 tar -xzf "$tmp/sm.tar.gz" -C "$tmp/x" --strip-components=1
 
-for required in libspidermonkey.a include/jsapi.h include/js-confdefs.h; do
+required_files=(libspidermonkey.a include/jsapi.h include/js-confdefs.h)
+if [[ -n ${SPIDERMONKEY_LOCAL_ARCHIVE:-} ]]; then
+    # The with-Intl flavor also ships jsrust (encoding_rs + ICU4X + Temporal),
+    # which wasmify.json's prebuilt_archives links instead of rust/'s staticlib.
+    required_files+=(libjsrust.a)
+fi
+for required in "${required_files[@]}"; do
     if [[ ! -e $tmp/x/$required ]]; then
-        echo "error: $required missing from $url" >&2
+        echo "error: $required missing from the engine archive" >&2
         exit 1
     fi
 done
