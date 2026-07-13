@@ -205,6 +205,94 @@ if [[ -n ${SPIDERMONKEY_THREADS:-} ]]; then
         echo "error: WASI mutex patch no longer applies to $f" >&2
         exit 1
     }
+
+    # Atomics.waitAsync timeouts with the INTERNAL job queue: the timeout task
+    # goes into internalDelayedDispatchPriorityQueue, but internalDrain's
+    # condvar wait has no deadline — nothing wakes it when the delay expires
+    # (expired tasks are only flushed when some OTHER dispatch arrives), so a
+    # timeout-only waitAsync blocks js::RunJobs forever. Bound the wait by the
+    # earliest delayed task's endTime and flush on wake: the drain then wakes
+    # exactly when the timeout is due, with no polling. (Upstreamable: any
+    # embedding on UseInternalJobQueues hits this; the shell's own event loop
+    # masks it.)
+    f=$SRC/js/src/vm/OffThreadPromiseRuntimeState.cpp
+    if ! grep -q 'wait_until' "$f"; then
+        perl -0pi -e 's{      while \(internalDispatchQueue\(\)\.empty\(\)\) \{\n        internalDispatchQueueAppended\(\)\.wait\(lock\);\n      \}}{      while (internalDispatchQueue().empty()) \{\n        auto& delayed = internalDelayedDispatchPriorityQueue();\n        if (!delayed.empty()) \{\n          internalDispatchQueueAppended().wait_until(lock,\n                                                     delayed.highest().endTime());\n          dispatchDelayedTasks();\n        \} else \{\n          internalDispatchQueueAppended().wait(lock);\n        \}\n      \}}' "$f"
+    fi
+    grep -q 'wait_until' "$f" || {
+        echo "error: waitAsync delayed-dispatch patch no longer applies to $f" >&2
+        exit 1
+    }
+
+    # Companion query: an embedding running its own event loop (each agent's
+    # pump here) parks between drains and must know WHEN the next delayed
+    # dispatchable (a waitAsync timeout) is due, or it would park forever and
+    # the timeout would never be dispatched. Expose the earliest deadline;
+    # js.cc bounds each agent's futex wait by it.
+    h=$SRC/js/src/vm/OffThreadPromiseRuntimeState.h
+    if ! grep -q 'earliestDelayedDispatchMs' "$h"; then
+        perl -0pi -e 's/(  bool internalHasPending\(AutoLockHelperThreadState& lock\);\n)/$1\n  \/\/ Milliseconds until the earliest delayed dispatchable (an\n  \/\/ Atomics.waitAsync timeout) is due: 0 if one is already due, -1 if none\n  \/\/ is pending. For embeddings that park between drains.\n  int64_t earliestDelayedDispatchMs();\n/' "$h"
+        perl -0pi -e 's/\}  \/\/ namespace js\n\n#endif  \/\/ vm_OffThreadPromiseRuntimeState_h/\/\* wasm2go embedding hooks: pumps parked on their own primitive (a futex)\n \* cannot hear internalDispatchQueueAppended_, so every internal dispatch\n \* also fires this hook. The callback runs under gHelperThreadLock and must\n \* not take locks; spurious wakes are benign. \*\/\nvoid SetWasm2GoDispatchWakeup(void (*fn)());\nvoid Wasm2GoNotifyDispatchWakeup();\n\n\}  \/\/ namespace js\n\n#endif  \/\/ vm_OffThreadPromiseRuntimeState_h/' "$h"
+    fi
+    grep -q 'earliestDelayedDispatchMs' "$h" || {
+        echo "error: delayed-deadline header patch no longer applies to $h" >&2
+        exit 1
+    }
+    grep -q 'SetWasm2GoDispatchWakeup' "$h" || {
+        echo "error: dispatch-wakeup header patch no longer applies to $h" >&2
+        exit 1
+    }
+    if ! grep -q 'Wasm2GoEarliestDelayedDispatchMs' "$f"; then
+        cat >> "$f" <<'CPPEOF'
+
+int64_t js::OffThreadPromiseRuntimeState::earliestDelayedDispatchMs() {
+  AutoLockHelperThreadState lock;
+  auto& queue = internalDelayedDispatchPriorityQueue();
+  if (queue.empty()) {
+    return -1;
+  }
+  mozilla::TimeStamp now = mozilla::TimeStamp::Now();
+  mozilla::TimeStamp end = queue.highest().endTime();
+  if (end <= now) {
+    return 0;
+  }
+  return int64_t((end - now).ToMilliseconds()) + 1;
+}
+
+namespace js {
+int64_t Wasm2GoEarliestDelayedDispatchMs(JSContext* cx) {
+  return cx->runtime()->offThreadPromiseState.ref().earliestDelayedDispatchMs();
+}
+
+/* An embedding pump parked on its own primitive (each wasm2go agent parks on
+ * a futex) cannot hear internalDispatchQueueAppended_. This hook fires after
+ * every internal dispatch-queue append, so the embedding can wake its pumps;
+ * spurious wakes are benign (a pump re-checks and re-parks). Called under
+ * gHelperThreadLock: the callback must not take locks. */
+static void (*sWasm2GoDispatchWakeup)() = nullptr;
+void SetWasm2GoDispatchWakeup(void (*fn)()) { sWasm2GoDispatchWakeup = fn; }
+void Wasm2GoNotifyDispatchWakeup() {
+  if (sWasm2GoDispatchWakeup) {
+    sWasm2GoDispatchWakeup();
+  }
+}
+}  // namespace js
+CPPEOF
+    fi
+    # Fire the wakeup hook at both append sites (direct dispatch and
+    # delayed-task flush share internalDispatchQueueAppended().notify_one()).
+    if ! grep -q 'Wasm2GoNotifyDispatchWakeup();' "$f"; then
+        perl -0pi -e 's/(  \/\/ Wake up internalDrain\(\) if it is waiting for a job to finish\.\n  state\.internalDispatchQueueAppended\(\)\.notify_one\(\);\n  return true;)/  \/\/ Wake up internalDrain() if it is waiting for a job to finish.\n  state.internalDispatchQueueAppended().notify_one();\n  js::Wasm2GoNotifyDispatchWakeup();\n  return true;/' "$f"
+        perl -0pi -e 's/(    internalDispatchQueueAppended\(\)\.notify_one\(\);\n  \}\n\})/    internalDispatchQueueAppended().notify_one();\n    js::Wasm2GoNotifyDispatchWakeup();\n  \}\n\}/' "$f"
+    fi
+    grep -q 'Wasm2GoEarliestDelayedDispatchMs' "$f" || {
+        echo "error: delayed-deadline impl patch no longer applies to $f" >&2
+        exit 1
+    }
+    [[ $(grep -c 'js::Wasm2GoNotifyDispatchWakeup();' "$f") -eq 2 ]] || {
+        echo "error: dispatch-wakeup call-site patch no longer applies to $f (want both append sites)" >&2
+        exit 1
+    }
 fi
 
 

@@ -345,27 +345,32 @@ static bool builtin_set_timeout(JSContext *cx, unsigned argc, JS::Value *vp) {
 /* Fire every due timer (or drop them all on shutdown). Reports whether any
  * callback ran. */
 static bool host_timers_run(JSContext *cx, HostTimerQueue *q, bool shutting_down) {
-    bool ran = false;
-    for (;;) {
-        JS::PersistentRootedValue *fn = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(q->mu);
-            uint64_t now = monotonic_ms();
-            for (size_t i = 0; i < q->timers.size(); i++) {
-                if (shutting_down) {
-                    delete q->timers[i].fn;
-                    q->timers.erase(q->timers.begin() + i);
-                    i--;
-                } else if (q->timers[i].due_ms <= now) {
-                    fn = q->timers[i].fn;
-                    q->timers.erase(q->timers.begin() + i);
-                    break;
-                }
+    /* ONE BATCH PER CALL: only timers already due when this call started run
+     * now; a timer armed by one of these callbacks waits for the NEXT call,
+     * however soon it is due. Draining to exhaustion instead would let a
+     * zero-delay self-rescheduling timer (test262's `$262.agent.setTimeout(f,
+     * 0)` polling idiom) monopolize the pump: the caller alternates timers
+     * with js::RunJobs, and it is that interleave which lets engine-delayed
+     * work (Atomics.waitAsync timeouts travel the internal dispatch queue)
+     * resolve while such a timer loop is polling for exactly that result. */
+    std::vector<JS::PersistentRootedValue *> batch;
+    {
+        std::lock_guard<std::mutex> lock(q->mu);
+        uint64_t now = monotonic_ms();
+        for (size_t i = 0; i < q->timers.size(); i++) {
+            if (shutting_down) {
+                delete q->timers[i].fn;
+                q->timers.erase(q->timers.begin() + i);
+                i--;
+            } else if (q->timers[i].due_ms <= now) {
+                batch.push_back(q->timers[i].fn);
+                q->timers.erase(q->timers.begin() + i);
+                i--;
             }
         }
-        if (!fn) {
-            return ran;
-        }
+    }
+    bool ran = false;
+    for (JS::PersistentRootedValue *fn : batch) {
         JS::RootedValue f(cx, fn->get());
         delete fn;
         JS::RootedValue rval(cx);
@@ -374,6 +379,7 @@ static bool host_timers_run(JSContext *cx, HostTimerQueue *q, bool shutting_down
         }
         ran = true;
     }
+    return ran;
 }
 
 static bool host_timers_pending(HostTimerQueue *q) {
@@ -877,8 +883,24 @@ static bool test262_create_realm(JSContext *cx, unsigned argc, JS::Value *vp) {
 
 #include <pthread.h>
 
+#include <algorithm>
 #include <deque>
 #include <mutex>
+
+namespace js {
+/* Added by the engine patch in scripts/build-engine-intl.sh (threads builds):
+ * milliseconds until the earliest engine-delayed dispatchable (an
+ * Atomics.waitAsync timeout) is due — 0 if one is already due, -1 if none.
+ * The agent pump bounds its idle futex wait by this, since such tasks are
+ * invisible to RunJobs until dispatched. */
+extern int64_t Wasm2GoEarliestDelayedDispatchMs(JSContext *cx);
+/* Also from the engine patch: fires the given callback after EVERY internal
+ * dispatch-queue append (an Atomics.notify resolving a waitAsync in another
+ * runtime arrives that way). Registered once in js_new so a parked agent
+ * pump hears cross-thread work; the callback runs under the engine's helper
+ * lock and must not take locks. */
+extern void SetWasm2GoDispatchWakeup(void (*fn)());
+}
 
 /* The broadcast rendezvous: the parent publishes one SAB (+ an int32 payload,
  * which is all test262 sends) and every started agent picks it up in its own
@@ -886,6 +908,19 @@ static bool test262_create_realm(JSContext *cx, unsigned argc, JS::Value *vp) {
 struct AgentState {
     std::mutex mu;
     std::deque<std::string> reports;
+
+    /* Deterministic agent lifecycle — no polling anywhere:
+     *  - epoch is a futex word. Agents park on it (memory.atomic.wait32,
+     *    which the Go side implements with channels); broadcast, leaving and
+     *    shutdown bump-and-notify it. No sleep loops.
+     *  - threads/contexts track every live agent so js_close can wake each
+     *    one (JS_RequestInterruptCallbackCanWait reaches even an agent parked
+     *    inside the engine) and JOIN it before the runtime dies. An agent
+     *    outliving its interpreter used to touch a destroyed runtime. */
+    std::atomic<uint32_t> epoch{0};
+    std::atomic<bool> shutdown{false};
+    std::vector<pthread_t> threads;
+    std::vector<JSContext *> contexts;
 
     /* The broadcast SAB, serialized. Public JSAPI has no "wrap this memory as a
      * SharedArrayBuffer" entry point; the SPEC route — and the one the
@@ -899,9 +934,30 @@ struct AgentState {
 
 static AgentState g_agents;
 
+/* Bump the event epoch and wake every agent parked on it. Called on
+ * broadcast, on leaving, and on shutdown. */
+static void agent_event_notify_all() {
+    g_agents.epoch.fetch_add(1, std::memory_order_seq_cst);
+    __builtin_wasm_memory_atomic_notify((int *)&g_agents.epoch, INT32_MAX);
+}
+
+/* Park until the epoch moves past `seen` (or the timeout, in ns, expires;
+ * negative = forever). The futex compare-and-park makes this race-free:
+ * an epoch bump between load and wait returns immediately. */
+static void agent_event_wait(uint32_t seen, int64_t timeout_ns) {
+    __builtin_wasm_memory_atomic_wait32((int *)&g_agents.epoch, (int32_t)seen, timeout_ns);
+}
+
+/* Agents parent their runtimes to the main one — same agent cluster, which is
+ * what makes the SharedArrayBuffer waiter list and the off-thread promise
+ * bookkeeping (both cluster-scoped) reach them. */
+static JSRuntime *g_parent_runtime = nullptr;
+
+/* Agent diagnostics go to STDERR, never to the $262.agent report queue:
+ * test262 compares reports BY VALUE, so a diagnostic in the queue silently
+ * corrupts the assertion under test. */
 static void agent_milestone(const char *what) {
-    std::lock_guard<std::mutex> lock(g_agents.mu);
-    g_agents.reports.emplace_back(std::string("[milestone] ") + what);
+    fprintf(stderr, "[agent] %s\n", what);
 }
 
 
@@ -963,8 +1019,12 @@ static bool agent_sleep(JSContext *cx, unsigned argc, JS::Value *vp) {
     return true;
 }
 
+static thread_local bool t_agent_left = false;
+
 static bool agent_leaving(JSContext *cx, unsigned argc, JS::Value *vp) {
     JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+    t_agent_left = true;
+    agent_event_notify_all();
     args.rval().setUndefined();
     return true;
 }
@@ -1014,6 +1074,7 @@ static bool agent_broadcast(JSContext *cx, unsigned argc, JS::Value *vp) {
         g_agents.sab_payload = payload;
         g_agents.broadcast_ready = true;
     }
+    agent_event_notify_all();
     args.rval().setUndefined();
     return true;
 }
@@ -1059,14 +1120,19 @@ static bool agent_receive_broadcast(JSContext *cx, unsigned argc, JS::Value *vp)
     }
     JS::RootedValue cb(cx, args[0]);
 
-    /* Park until the parent broadcasts. Each agent reads the clone buffer under
-     * the lock and deserializes it into ITS OWN runtime; the SAB that comes out
-     * points at the same memory the parent's does. */
+    /* Park until the parent broadcasts — on the event futex, never a poll.
+     * The clone is read under the lock and deserialized into THIS agent's
+     * runtime; the resulting SAB shares the parent's memory. */
     JS::RootedValue sabVal(cx);
     int32_t payload = 0;
     for (;;) {
+        uint32_t seen = g_agents.epoch.load(std::memory_order_seq_cst);
         {
             std::lock_guard<std::mutex> lock(g_agents.mu);
+            if (g_agents.shutdown.load(std::memory_order_seq_cst)) {
+                JS_ReportErrorASCII(cx, "receiveBroadcast: interpreter shutting down");
+                return false;
+            }
             if (g_agents.broadcast_ready && g_agents.sab_clone) {
                 JS::CloneDataPolicy policy;
                 policy.allowSharedMemoryObjects();
@@ -1078,8 +1144,7 @@ static bool agent_receive_broadcast(JSContext *cx, unsigned argc, JS::Value *vp)
                 break;
             }
         }
-        struct timespec ts = {0, 200000}; /* 0.2 ms */
-        nanosleep(&ts, nullptr);
+        agent_event_wait(seen, -1);
     }
 
     JS::RootedValueArray<2> cbArgs(cx);
@@ -1097,10 +1162,22 @@ static bool agent_receive_broadcast(JSContext *cx, unsigned argc, JS::Value *vp)
 static void *agent_thread_main(void *arg) {
     std::unique_ptr<AgentStart> start(static_cast<AgentStart *>(arg));
 
-    JSContext *cx = JS_NewContext(JS::DefaultHeapMaxBytes);
+    /* The agent's own setTimeout queue (harness code runs on its global). */
+    HostTimerQueue timers;
+    t_timers = &timers;
+    t_agent_left = false;
+
+    JSContext *cx = JS_NewContext(JS::DefaultHeapMaxBytes, g_parent_runtime);
     if (!cx) {
         agent_milestone("JS_NewContext FAILED");
         return nullptr;
+    }
+    /* Blocking in Atomics.wait is what an agent is FOR; without this the
+     * engine throws "waiting is not allowed on this thread". */
+    JS_SetFutexCanWait(cx);
+    {
+        std::lock_guard<std::mutex> lock(g_agents.mu);
+        g_agents.contexts.push_back(cx);
     }
     if (!js::UseInternalJobQueues(cx) || !JS::InitSelfHostedCode(cx)) {
         agent_milestone("selfhosted FAILED");
@@ -1132,7 +1209,49 @@ static void *agent_thread_main(void *arg) {
         if (buf.init(cx, start->src.data(), start->src.size(), JS::SourceOwnership::Borrowed)) {
             JS::RootedValue rval(cx);
             if (JS::Evaluate(cx, opts, buf, &rval)) {
-                js::RunJobs(cx);
+                /* The agent's work usually CONTINUES past evaluation (async
+                 * receiveBroadcast callbacks). Deterministic loop, no polls:
+                 *  - js::RunJobs itself BLOCKS (internal condvar) while the
+                 *    engine holds outstanding off-thread promise work — a
+                 *    pending waitAsync parks here until notify or timeout.
+                 *  - Otherwise the agent parks on the event futex, bounded by
+                 *    the next DEADLINE it must act on: the earliest host
+                 *    timer, or the earliest engine-delayed dispatchable (an
+                 *    Atomics.waitAsync timeout — invisible to RunJobs'
+                 *    hasPending, so parking unbounded would strand it).
+                 *    broadcast, leaving and shutdown bump-and-notify the
+                 *    futex. */
+                while (!t_agent_left && !g_agents.shutdown.load(std::memory_order_seq_cst)) {
+                    bool ran = host_timers_run(cx, &timers, /* shutting_down */ false);
+                    js::RunJobs(cx);
+                    JS_ClearPendingException(cx);
+                    if (t_agent_left || g_agents.shutdown.load(std::memory_order_seq_cst)) {
+                        break;
+                    }
+                    if (ran) {
+                        continue; /* a timer fired: it may have queued jobs */
+                    }
+                    uint32_t seen = g_agents.epoch.load(std::memory_order_seq_cst);
+                    int64_t timeout_ns = -1;
+                    {
+                        std::lock_guard<std::mutex> lock(timers.mu);
+                        uint64_t now = monotonic_ms();
+                        for (auto &tm : timers.timers) {
+                            int64_t d = (int64_t)(tm.due_ms > now ? tm.due_ms - now : 0) * 1000000;
+                            if (timeout_ns < 0 || d < timeout_ns) {
+                                timeout_ns = d;
+                            }
+                        }
+                    }
+                    int64_t delayed_ms = js::Wasm2GoEarliestDelayedDispatchMs(cx);
+                    if (delayed_ms >= 0) {
+                        int64_t d = delayed_ms * 1000000;
+                        if (timeout_ns < 0 || d < timeout_ns) {
+                            timeout_ns = d;
+                        }
+                    }
+                    agent_event_wait(seen, timeout_ns);
+                }
             } else {
                 /* Surface the pending exception's message — "evaluate FAILED"
                  * alone names no cause. */
@@ -1155,7 +1274,14 @@ static void *agent_thread_main(void *arg) {
         }
         JS_ClearPendingException(cx);
     }
+    host_timers_run(cx, &timers, /* shutting_down */ true);
+    {
+        std::lock_guard<std::mutex> lock(g_agents.mu);
+        auto &v = g_agents.contexts;
+        v.erase(std::remove(v.begin(), v.end(), cx), v.end());
+    }
     JS_DestroyContext(cx);
+    t_timers = &g_timers;
     return nullptr;
 }
 
@@ -1177,7 +1303,12 @@ static bool agent_start(JSContext *cx, unsigned argc, JS::Value *vp) {
         JS_ReportErrorASCII(cx, "$262.agent.start: could not spawn an agent");
         return false;
     }
-    pthread_detach(tid);
+    /* NOT detached: js_close joins every agent so none can outlive the
+     * runtime it shares an agent cluster with. */
+    {
+        std::lock_guard<std::mutex> lock(g_agents.mu);
+        g_agents.threads.push_back(tid);
+    }
     args.rval().setUndefined();
     return true;
 }
@@ -1324,6 +1455,14 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
     /* A shell-like embedding, not a browser main thread: the main agent may
      * block in Atomics.wait (test262 CanBlockIsTrue). */
     JS_SetFutexCanWait(g_cx);
+#ifdef SPIDERMONKEY_WASM_THREADS
+    g_parent_runtime = JS_GetRuntime(g_cx);
+    /* Every internal dispatch (e.g. a notify resolving another runtime's
+     * waitAsync) wakes all parked agent pumps; each re-checks and re-parks.
+     * Without this an agent parked on the event futex never hears work
+     * arriving on its runtime's internal dispatch queue. */
+    js::SetWasm2GoDispatchWakeup(agent_event_notify_all);
+#endif
     if (!js::UseInternalJobQueues(g_cx)) {
         JS_DestroyContext(g_cx);
         g_cx = nullptr;
@@ -1464,6 +1603,36 @@ void js_close(uint64_t h) {
     if (!g_cx || h == 0) {
         return;
     }
+#ifdef SPIDERMONKEY_WASM_THREADS
+    /* Deterministic agent shutdown, then JOIN: an agent outliving this
+     * runtime would touch a destroyed agent cluster (SAB waiter list,
+     * off-thread promise state). shutdown+notify wakes agents parked on the
+     * event futex; the CanWait interrupt reaches ones parked inside the
+     * engine (Atomics.wait, RunJobs' internal drain). */
+    {
+        std::vector<pthread_t> threads;
+        {
+            std::lock_guard<std::mutex> lock(g_agents.mu);
+            g_agents.shutdown.store(true, std::memory_order_seq_cst);
+            threads = g_agents.threads;
+            for (JSContext *acx : g_agents.contexts) {
+                JS_RequestInterruptCallbackCanWait(acx);
+            }
+        }
+        agent_event_notify_all();
+        for (pthread_t t : threads) {
+            pthread_join(t, nullptr);
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_agents.mu);
+            g_agents.threads.clear();
+            g_agents.shutdown.store(false, std::memory_order_seq_cst);
+            g_agents.broadcast_ready = false;
+            g_agents.sab_clone.reset();
+            g_agents.reports.clear();
+        }
+    }
+#endif
     /* Persistent roots must be released while their runtime is still alive. */
     if (g_modules) {
         for (auto &entry : *g_modules) {
