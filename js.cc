@@ -28,6 +28,7 @@
  * embedding without its own event loop uses. */
 #include <jsfriendapi.h>
 
+#include <js/Array.h>
 #include <js/ArrayBuffer.h>
 #include <js/HelperThreadAPI.h>
 #include <js/SharedArrayBuffer.h>
@@ -39,9 +40,12 @@
 #include <js/Exception.h>
 #include <js/GCAPI.h>
 #include <js/GlobalObject.h>
+#include <js/CharacterEncoding.h>
 #include <js/Initialization.h>
 #include <js/Interrupt.h>
+#include <js/JSON.h>
 #include <js/Modules.h>
+#include <js/Object.h>
 #include <js/Promise.h>
 #include <js/PropertyAndElement.h>
 #include <js/Realm.h>
@@ -402,6 +406,209 @@ static bool host_timers_pending(HostTimerQueue *q) {
     return !q->timers.empty();
 }
 
+/* ---- host-registered functions ---------------------------------------------
+ *
+ * js_register_host_func defines a global function whose calls are forwarded
+ * to the HOST (Go): arguments travel out as a JSON array, the return value
+ * comes back as a one-byte tag ('R' result / 'E' error message) followed by
+ * payload. The transport is a pair of env imports:
+ *
+ *   go_host_call(name, name_len, args, args_len, out, out_cap) -> total_len
+ *     Invokes the host handler ONCE. If the payload fits out_cap it is
+ *     already in `out`; otherwise the host keeps it staged (per instance)
+ *     and the guest re-fetches after growing — the handler is never invoked
+ *     twice, and nothing here re-enters the wasm instance from host code.
+ *   go_host_result(out)
+ *     Copies the staged payload and clears it.
+ */
+extern "C" {
+__attribute__((import_module("env"), import_name("go_host_call")))
+uint32_t go_host_call(const char *key, uint32_t key_len, const char *args,
+                      uint32_t args_len, uint64_t this_id, char *out,
+                      uint32_t out_cap);
+__attribute__((import_module("env"), import_name("go_host_result")))
+void go_host_result(char *out);
+}
+
+/* Instances of host-registered types: reserved slot 0 holds the Go-side
+ * handle (a sequential counter, exact in a double). */
+static const JSClass host_instance_class = {
+    "HostObject", JSCLASS_HAS_RESERVED_SLOTS(1)};
+
+/* Prototypes of host-registered types, keyed by type name. A C++-side map
+ * because the constructor cannot carry it: the engine owns a JSFUN_CONSTRUCTOR
+ * function's extended slots for its own lazy-prototype bookkeeping, and a
+ * property lookup from inside the active constructor call wedges. Released in
+ * js_close. */
+static std::map<std::string, JS::PersistentRootedObject *> *g_host_protos = nullptr;
+
+static bool host_func_call(JSContext *cx, unsigned argc, JS::Value *vp);
+
+/* `new T(...)`: forward to the host constructor (key "T.#ctor"); the host
+ * returns the new instance's handle, which we pin into the object.
+ *
+ * Everything derived from the CALLEE is read up front: CallArgs::rval() writes
+ * vp[0], which IS the callee slot, so the forwarded call below overwrites the
+ * callee with its return value. Reading args.callee() afterwards would see a
+ * number, not the constructor. */
+static bool host_type_construct(JSContext *cx, unsigned argc, JS::Value *vp) {
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+    JS::RootedObject callee(cx, &args.callee());
+    JS::RootedValue keyVal(cx, js::GetFunctionNativeReserved(callee, 0));
+    if (!keyVal.isString()) {
+        JS_ReportErrorASCII(cx, "host type has no dispatch key");
+        return false;
+    }
+    JS::RootedString keyStr(cx, keyVal.toString());
+    JS::UniqueChars keyUtf8 = JS_EncodeStringToUTF8(cx, keyStr);
+    if (!keyUtf8) {
+        return false;
+    }
+    std::string typeName(keyUtf8.get());
+    size_t suffix = typeName.rfind(".#ctor");
+    if (suffix != std::string::npos) {
+        typeName.resize(suffix);
+    }
+    /* The prototype comes from the C++ registry: the engine owns a
+     * JSFUN_CONSTRUCTOR's own prototype bookkeeping, and a property lookup
+     * from inside the running constructor re-enters that machinery. */
+    JS::RootedObject proto(cx);
+    if (g_host_protos) {
+        auto it = g_host_protos->find(typeName);
+        if (it != g_host_protos->end()) {
+            proto = it->second->get();
+        }
+    }
+    if (!proto) {
+        JS_ReportErrorASCII(cx, "host type has no prototype");
+        return false;
+    }
+
+    /* Forward to the host; from here on the callee slot is clobbered. */
+    if (!host_func_call(cx, argc, vp)) {
+        return false;
+    }
+    if (!args.rval().isNumber()) {
+        JS_ReportErrorASCII(cx, "host constructor returned no handle");
+        return false;
+    }
+    double id = args.rval().toNumber();
+    JS::RootedObject obj(cx, JS_NewObjectWithGivenProto(cx, &host_instance_class, proto));
+    if (!obj) {
+        return false;
+    }
+    JS::SetReservedSlot(obj, 0, JS::DoubleValue(id));
+    args.rval().setObject(*obj);
+    return true;
+}
+
+/* Collector for JS_Stringify: appends UTF-16 chunks as UTF-8. */
+static bool stringify_collect(const char16_t *buf, uint32_t len, void *data) {
+    auto *out = static_cast<std::string *>(data);
+    for (uint32_t i = 0; i < len; i++) {
+        char16_t c = buf[i];
+        if (c < 0x80) {
+            out->push_back(char(c));
+        } else if (c < 0x800) {
+            out->push_back(char(0xC0 | (c >> 6)));
+            out->push_back(char(0x80 | (c & 0x3F)));
+        } else {
+            /* Surrogate pairs pass through as CESU-8-ish triples; the host
+             * only round-trips the bytes back into a JS string, so lone
+             * surrogates cannot corrupt anything host-side. */
+            out->push_back(char(0xE0 | (c >> 12)));
+            out->push_back(char(0x80 | ((c >> 6) & 0x3F)));
+            out->push_back(char(0x80 | (c & 0x3F)));
+        }
+    }
+    return true;
+}
+
+static bool host_func_call(JSContext *cx, unsigned argc, JS::Value *vp) {
+    JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
+
+    /* The dispatch key lives in the function's native reserved slot —
+     * guest code cannot rename it out from under the host. */
+    JS::RootedObject calleeObj(cx, &args.callee());
+    JS::RootedValue keyVal(cx, js::GetFunctionNativeReserved(calleeObj, 0));
+    if (!keyVal.isString()) {
+        JS_ReportErrorASCII(cx, "host function has no dispatch key");
+        return false;
+    }
+    JS::RootedString nameStr(cx, keyVal.toString());
+    JS::UniqueChars nameUtf8 = JS_EncodeStringToUTF8(cx, nameStr);
+    if (!nameUtf8) {
+        return false;
+    }
+    std::string name(nameUtf8.get());
+
+    /* Receiver identity: instances of host types carry their Go-side handle
+     * in reserved slot 0; plain calls send 0. */
+    uint64_t thisId = 0;
+    /* A construct call's thisv is a magic value that must not be read. */
+    if (!args.isConstructing() && args.thisv().isObject()) {
+        JS::RootedObject thisObj(cx, &args.thisv().toObject());
+        if (JS::GetClass(thisObj) == &host_instance_class) {
+            thisId = (uint64_t)JS::GetReservedSlot(thisObj, 0).toDouble();
+        }
+    }
+
+    /* Arguments as a JSON array. */
+    JS::RootedObject arr(cx, JS::NewArrayObject(cx, args));
+    if (!arr) {
+        return false;
+    }
+    JS::RootedValue arrVal(cx, JS::ObjectValue(*arr));
+    std::string argsJson;
+    if (!JS_Stringify(cx, &arrVal, nullptr, JS::NullHandleValue, stringify_collect,
+                      &argsJson)) {
+        return false;
+    }
+
+    std::vector<char> out(4096);
+    uint32_t total = go_host_call(name.data(), (uint32_t)name.size(), argsJson.data(),
+                                  (uint32_t)argsJson.size(), thisId, out.data(),
+                                  (uint32_t)out.size());
+    if (total > out.size()) {
+        out.resize(total);
+        go_host_result(out.data());
+    }
+    if (total == 0) {
+        JS_ReportErrorUTF8(cx, "host function not registered: %s", name.c_str());
+        return false;
+    }
+    char tag = out[0];
+    std::string payload(out.data() + 1, total - 1);
+    if (tag == 'E') {
+        JS_ReportErrorUTF8(cx, "%s", payload.c_str());
+        return false;
+    }
+    /* 'R': payload is the JSON of the return value. Parse via the realm's
+     * own JSON.parse so numbers/strings/objects come back as real values. */
+    JS::RootedString js(cx, JS_NewStringCopyUTF8N(
+                                cx, JS::UTF8Chars(payload.data(), payload.size())));
+    if (!js) {
+        return false;
+    }
+    JS::RootedValue jsonVal(cx);
+    JS::RootedObject global(cx, JS::CurrentGlobalOrNull(cx));
+    JS::RootedValue jsonObjVal(cx);
+    if (!global || !JS_GetProperty(cx, global, "JSON", &jsonObjVal) ||
+        !jsonObjVal.isObject()) {
+        JS_ReportErrorASCII(cx, "JSON object unavailable");
+        return false;
+    }
+    JS::RootedObject jsonObj(cx, &jsonObjVal.toObject());
+    JS::RootedValue strVal(cx, JS::StringValue(js));
+    JS::HandleValueArray parseArgs(strVal);
+    if (!JS_CallFunctionName(cx, jsonObj, "parse", parseArgs, &jsonVal)) {
+        return false;
+    }
+    args.rval().set(jsonVal);
+    return true;
+}
+
 static bool install_builtins(JSContext *cx, JS::HandleObject global) {
     if (!JS_DefineFunction(cx, global, "print", builtin_print, 0, 0)) {
         return false;
@@ -490,7 +697,14 @@ static std::string make_result(bool ok, const std::string &result, const std::st
             j += "\"";
         }
         j += "]";
-        g_missing_modules.clear();
+        if (g_host_protos) {
+        for (auto &entry : *g_host_protos) {
+            delete entry.second;
+        }
+        delete g_host_protos;
+        g_host_protos = nullptr;
+    }
+    g_missing_modules.clear();
     }
     j += "}";
     return j;
@@ -792,6 +1006,128 @@ std::string js_module_register(uint64_t h, const char *specifier_p, uint32_t spe
      * source, per HostLoadImportedModule), and so the same source can serve
      * as JS or JSON depending on the request's import attributes. */
     register_module_source(specifier, src);
+    return make_result(true, "registered", "");
+}
+
+/* Create a forwarding stub whose native reserved slot 0 carries `key`. */
+static JSObject *new_host_stub(JSContext *cx, const std::string &key,
+                               const std::string &name, unsigned flags, JSNative native) {
+    JSFunction *fn = js::NewFunctionWithReserved(cx, native, 0, flags, name.c_str());
+    if (!fn) {
+        return nullptr;
+    }
+    JS::RootedObject fnObj(cx, JS_GetFunctionObject(fn));
+    JS::RootedString keyStr(cx, JS_NewStringCopyN(cx, key.data(), key.size()));
+    if (!keyStr) {
+        return nullptr;
+    }
+    js::SetFunctionNativeReserved(fnObj, 0, JS::StringValue(keyStr));
+    return fnObj;
+}
+
+std::string js_register_host_func(uint64_t h, const char *name_p, uint32_t name_len) {
+    const std::string name(name_p ? name_p : "", name_p ? name_len : 0);
+    if (!g_cx || h == 0) {
+        g_stdout.clear();
+        g_stderr.clear();
+        return make_result(false, "", "no runtime");
+    }
+    g_stdout.clear();
+    g_stderr.clear();
+    if (name.empty()) {
+        return make_result(false, "", "empty function name");
+    }
+    JS::RootedObject global(g_cx, g_global->get());
+    JSAutoRealm ar(g_cx, global);
+    JS::RootedObject fnObj(g_cx, new_host_stub(g_cx, name, name, 0, host_func_call));
+    if (!fnObj) {
+        return make_result(false, "", take_error(g_cx));
+    }
+    JS::RootedValue fnVal(g_cx, JS::ObjectValue(*fnObj));
+    if (!JS_DefineProperty(g_cx, global, name.c_str(), fnVal, JSPROP_ENUMERATE)) {
+        return make_result(false, "", take_error(g_cx));
+    }
+    return make_result(true, "registered", "");
+}
+
+std::string js_register_host_type(uint64_t h, const char *name_p, uint32_t name_len) {
+    const std::string name(name_p ? name_p : "", name_p ? name_len : 0);
+    if (!g_cx || h == 0) {
+        g_stdout.clear();
+        g_stderr.clear();
+        return make_result(false, "", "no runtime");
+    }
+    g_stdout.clear();
+    g_stderr.clear();
+    if (name.empty()) {
+        return make_result(false, "", "empty type name");
+    }
+    JS::RootedObject global(g_cx, g_global->get());
+    JSAutoRealm ar(g_cx, global);
+    JS::RootedObject ctor(g_cx, new_host_stub(g_cx, name + ".#ctor", name,
+                                              JSFUN_CONSTRUCTOR, host_type_construct));
+    if (!ctor) {
+        return make_result(false, "", take_error(g_cx));
+    }
+    JS::RootedObject proto(g_cx, JS_NewPlainObject(g_cx));
+    if (!proto) {
+        return make_result(false, "", take_error(g_cx));
+    }
+    JS::RootedValue protoVal(g_cx, JS::ObjectValue(*proto));
+    JS::RootedValue ctorVal(g_cx, JS::ObjectValue(*ctor));
+    if (!g_host_protos) {
+        g_host_protos = new std::map<std::string, JS::PersistentRootedObject *>();
+    }
+    auto it = g_host_protos->find(name);
+    if (it != g_host_protos->end()) {
+        delete it->second;
+        g_host_protos->erase(it);
+    }
+    (*g_host_protos)[name] = new JS::PersistentRootedObject(g_cx, proto);
+    if (!JS_DefineProperty(g_cx, ctor, "prototype", protoVal,
+                           JSPROP_PERMANENT | JSPROP_READONLY) ||
+        !JS_DefineProperty(g_cx, proto, "constructor", ctorVal, 0) ||
+        !JS_DefineProperty(g_cx, global, name.c_str(), ctorVal, JSPROP_ENUMERATE)) {
+        return make_result(false, "", take_error(g_cx));
+    }
+    return make_result(true, "registered", "");
+}
+
+std::string js_register_host_method(uint64_t h, const char *type_p, uint32_t type_len,
+                                    const char *name_p, uint32_t name_len) {
+    const std::string type(type_p ? type_p : "", type_p ? type_len : 0);
+    const std::string name(name_p ? name_p : "", name_p ? name_len : 0);
+    if (!g_cx || h == 0) {
+        g_stdout.clear();
+        g_stderr.clear();
+        return make_result(false, "", "no runtime");
+    }
+    g_stdout.clear();
+    g_stderr.clear();
+    if (type.empty() || name.empty()) {
+        return make_result(false, "", "empty type or method name");
+    }
+    JS::RootedObject global(g_cx, g_global->get());
+    JSAutoRealm ar(g_cx, global);
+    JS::RootedValue ctorVal(g_cx);
+    if (!JS_GetProperty(g_cx, global, type.c_str(), &ctorVal) || !ctorVal.isObject()) {
+        return make_result(false, "", "type not registered: " + type);
+    }
+    JS::RootedObject ctor(g_cx, &ctorVal.toObject());
+    JS::RootedValue protoVal(g_cx);
+    if (!JS_GetProperty(g_cx, ctor, "prototype", &protoVal) || !protoVal.isObject()) {
+        return make_result(false, "", "type has no prototype: " + type);
+    }
+    JS::RootedObject proto(g_cx, &protoVal.toObject());
+    JS::RootedObject fnObj(g_cx, new_host_stub(g_cx, type + "." + name, name, 0,
+                                               host_func_call));
+    if (!fnObj) {
+        return make_result(false, "", take_error(g_cx));
+    }
+    JS::RootedValue fnVal(g_cx, JS::ObjectValue(*fnObj));
+    if (!JS_DefineProperty(g_cx, proto, name.c_str(), fnVal, JSPROP_ENUMERATE)) {
+        return make_result(false, "", take_error(g_cx));
+    }
     return make_result(true, "registered", "");
 }
 

@@ -85,6 +85,9 @@
       "js_module_register",
       "js_eval_module",
       "js_install_test262_hooks",
+      "js_register_host_func",
+      "js_register_host_method",
+      "js_register_host_type",
       "js_close",
       "js_interrupt_addr",
       "js_interrupt_bits_addr",
@@ -118,7 +121,7 @@
   },
   "phases": {
     "gen-proto": {
-      "completed_at": "2026-07-12T16:22:40Z",
+      "completed_at": "2026-07-13T14:29:07Z",
       "upstream_commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
       "output_files": [
         "proto/spidermonkey.proto",
@@ -128,7 +131,7 @@
       ]
     },
     "parse-headers": {
-      "completed_at": "2026-07-12T16:22:40Z",
+      "completed_at": "2026-07-13T14:29:07Z",
       "upstream_commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
       "output_files": [
         "api-spec.json"

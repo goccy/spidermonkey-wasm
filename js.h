@@ -120,6 +120,24 @@ std::string js_module_register(uint64_t h, const char *specifier, uint32_t speci
 std::string js_eval_module(uint64_t h, const char *specifier, uint32_t specifier_len,
                            const char *src, uint32_t src_len);
 
+/* Define a global function `name` whose CALLS are forwarded to the host:
+ * arguments travel to the host as a JSON array (via the env.go_host_call /
+ * go_host_result imports the embedding must provide) and the host's return
+ * value comes back as JSON. This is the deliberate host-surface opt-in — the
+ * sandbox exposes nothing until the embedder registers a function. */
+std::string js_register_host_func(uint64_t h, const char *name, uint32_t name_len);
+
+/* Define a global constructor `name` (a host type). `new name(...)` forwards
+ * to the host's registered constructor, whose returned handle identifies the
+ * Go-side receiver; instances carry it for method dispatch. */
+std::string js_register_host_type(uint64_t h, const char *name, uint32_t name_len);
+
+/* Define method `name` on registered host type `type`'s prototype. Calls
+ * forward to the host with the receiver's handle, so the host can route to
+ * the Go value the instance was constructed around. */
+std::string js_register_host_method(uint64_t h, const char *type, uint32_t type_len,
+                                    const char *name, uint32_t name_len);
+
 /* Install the $262 test-support object (https://github.com/tc39/test262
  * INTERPRETING.md) on this runtime's global: createRealm (same-compartment
  * realm with its own $262), detachArrayBuffer, evalScript, gc, global, and an
