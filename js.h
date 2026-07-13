@@ -96,9 +96,19 @@ std::string js_pump_jobs(uint64_t h);
  * fetch, register, and retry. Nothing is registered by default: with no
  * registrations, every import fails (sandbox default-deny). */
 
-/* Compile `src` as an ES module and register it under `specifier`. Returns the
- * usual JSON result; "ok" false carries the compile error. Re-registering a
- * specifier replaces the module (affects future lookups only). */
+/* Register `src` under `specifier`. Compilation is DEFERRED to the first
+ * import that resolves to it: a compile error then rejects that import with
+ * its real type (a dynamic import of script-only source rejects with
+ * SyntaxError, per HostLoadImportedModule), and the same source can load as a
+ * JS module or — when the import carries `with { type: "json" }` — as a JSON
+ * module. Re-registering a specifier replaces the source (affects future
+ * lookups only).
+ *
+ * When an import misses the registry, the failure carries the resolved
+ * specifier in the error text AND every result JSON gains a
+ * "missing_modules":[...] array — the latter is the only channel when guest
+ * code catches a dynamic import rejection itself. The host loader's protocol
+ * is: fetch, register, re-run. */
 std::string js_module_register(uint64_t h, const char *specifier, uint32_t specifier_len,
                                const char *src, uint32_t src_len);
 

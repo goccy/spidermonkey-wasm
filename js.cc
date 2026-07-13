@@ -122,10 +122,25 @@ static bool g_discovering = false;
  * Re-arming can therefore only spin for as long as the flag takes to become
  * visible. It cannot spin forever unless something trips interruptBits_ and
  * never sets g_interrupt, which nothing in this design does. */
+#ifdef SPIDERMONKEY_WASM_THREADS
+static bool agents_shutting_down(); /* defined with AgentState below */
+#endif
+
 static bool interrupt_cb(JSContext *cx) {
     if (g_discovering) {
         return true;
     }
+#ifdef SPIDERMONKEY_WASM_THREADS
+    /* js_close interrupts every agent context (CanWait) so an agent parked
+     * inside the engine — an Atomics.wait with time left — unblocks NOW.
+     * Without this arm the callback would judge the interrupt "not ours",
+     * re-arm, and RESUME the wait: close would stall for the remaining
+     * timeout. Terminate the agent script instead (uncatchable, like the
+     * host interrupt). */
+    if (agents_shutting_down()) {
+        return false;
+    }
+#endif
     if (g_interrupt) {
         g_interrupt = 0;
         return false;
@@ -449,6 +464,13 @@ static std::string json_field(const char *key, const std::string &val, bool comm
     return s;
 }
 
+/* Module specifiers that missed the registry since the last result was built.
+ * A DYNAMIC import failure is caught by guest code (the promise rejection is
+ * the test's to inspect), so the host cannot learn the missing specifier from
+ * the error text; this side channel carries it out so a host loader can
+ * fetch + register + retry. */
+static std::vector<std::string> g_missing_modules;
+
 static std::string make_result(bool ok, const std::string &result, const std::string &error) {
     std::string j = "{\"ok\":";
     j += ok ? "true" : "false";
@@ -457,6 +479,19 @@ static std::string make_result(bool ok, const std::string &result, const std::st
     j += json_field("stdout", g_stdout, true);
     j += json_field("stderr", g_stderr, true);
     j += json_field("error", error, false);
+    if (!g_missing_modules.empty()) {
+        j += ",\"missing_modules\":[";
+        for (size_t i = 0; i < g_missing_modules.size(); i++) {
+            if (i) {
+                j += ",";
+            }
+            j += "\"";
+            json_escape(g_missing_modules[i], j);
+            j += "\"";
+        }
+        j += "]";
+        g_missing_modules.clear();
+    }
     j += "}";
     return j;
 }
@@ -511,11 +546,23 @@ static std::string take_error(JSContext *cx) {
 
 /* ---- ES modules ----------------------------------------------------------- */
 
-/* Registered modules, keyed by specifier. Values are heap-allocated
- * PersistentRooteds released in js_close (they must not outlive the runtime).
- * The registry IS the loader: the host resolves specifiers to sources and
- * registers them; the guest never does I/O (see js.h). */
-static std::map<std::string, JS::PersistentRootedObject *> *g_modules = nullptr;
+/* Registered modules, keyed by specifier. The registry stores SOURCE and
+ * compiles lazily, per requested module type, on first import:
+ *  - a compile error then surfaces AT IMPORT TIME with its real type (a
+ *    dynamic import of script-only code must reject with SyntaxError, not
+ *    with a host "could not register" error), and
+ *  - one registered source can serve both as a JS module and as a JSON
+ *    module (import attributes decide, per request).
+ * Compiled records are heap-allocated PersistentRooteds released in js_close
+ * (they must not outlive the runtime). The registry IS the loader: the host
+ * resolves specifiers to sources and registers them; the guest never does
+ * I/O (see js.h). */
+struct ModuleEntry {
+    std::string source;
+    JS::PersistentRootedObject *js = nullptr;   /* ModuleType::JavaScript */
+    JS::PersistentRootedObject *json = nullptr; /* ModuleType::JSON */
+};
+static std::map<std::string, ModuleEntry> *g_modules = nullptr;
 
 /* Resolve ./ and ../ in `spec` against the registry key of the importing
  * module. Bare and absolute-looking specifiers are exact registry keys. */
@@ -569,17 +616,37 @@ static std::string jsstring_to_utf8(JSContext *cx, JS::HandleString str) {
     return std::string(utf8.get());
 }
 
-/* Compile src as a module, tag it with its specifier (the private value the
- * load hook reads back through GetScriptPrivate), and register it. */
-static JSObject *compile_and_register_module(JSContext *cx, const std::string &specifier,
-                                             const std::string &src) {
+/* Store src under specifier; compilation happens lazily at import. */
+static void register_module_source(const std::string &specifier, const std::string &src) {
+    if (!g_modules) {
+        g_modules = new std::map<std::string, ModuleEntry>();
+    }
+    ModuleEntry &e = (*g_modules)[specifier];
+    delete e.js;
+    delete e.json;
+    e = ModuleEntry{};
+    e.source = src;
+}
+
+/* Compile the entry's source for the requested module type (caching the
+ * record) and tag it with its specifier — the private value the load hook and
+ * the import.meta hook read back. A compile error stays pending so the import
+ * fails with its REAL type (e.g. SyntaxError for script-only source). */
+static JSObject *compile_module_entry(JSContext *cx, const std::string &specifier,
+                                      ModuleEntry &e, JS::ModuleType type) {
+    JS::PersistentRootedObject *&slot = (type == JS::ModuleType::JSON) ? e.json : e.js;
+    if (slot) {
+        return slot->get();
+    }
     JS::CompileOptions opts(cx);
     opts.setFileAndLine(specifier.c_str(), 1);
     JS::SourceText<mozilla::Utf8Unit> buf;
-    if (!buf.init(cx, src.data(), src.size(), JS::SourceOwnership::Borrowed)) {
+    if (!buf.init(cx, e.source.data(), e.source.size(), JS::SourceOwnership::Borrowed)) {
         return nullptr;
     }
-    JS::RootedObject module(cx, JS::CompileModule(cx, opts, buf));
+    JS::RootedObject module(cx, type == JS::ModuleType::JSON
+                                    ? JS::CompileJsonModule(cx, opts, buf)
+                                    : JS::CompileModule(cx, opts, buf));
     if (!module) {
         return nullptr;
     }
@@ -588,21 +655,21 @@ static JSObject *compile_and_register_module(JSContext *cx, const std::string &s
         return nullptr;
     }
     JS::SetModulePrivate(module, JS::StringValue(specStr));
-
-    if (!g_modules) {
-        g_modules = new std::map<std::string, JS::PersistentRootedObject *>();
-    }
-    auto it = g_modules->find(specifier);
-    if (it != g_modules->end()) {
-        delete it->second;
-        g_modules->erase(it);
-    }
-    (*g_modules)[specifier] = new JS::PersistentRootedObject(cx, module);
+    slot = new JS::PersistentRootedObject(cx, module);
     return module;
 }
 
-/* Look up the module a request resolves to, or report (and leave pending) a
- * "module not registered" error. */
+/* Register + compile eagerly as a JS module (js_eval_module's entry path,
+ * where an immediate compile error is the caller's answer). */
+static JSObject *compile_and_register_module(JSContext *cx, const std::string &specifier,
+                                             const std::string &src) {
+    register_module_source(specifier, src);
+    return compile_module_entry(cx, specifier, (*g_modules)[specifier],
+                                JS::ModuleType::JavaScript);
+}
+
+/* Look up (and lazily compile) the module a request resolves to, or report
+ * (and leave pending) a "module not registered" error. */
 static JSObject *lookup_module(JSContext *cx, JS::HandleObject moduleRequest,
                                JS::Handle<JSScript *> referrer) {
     JS::RootedString specStr(cx, JS::GetModuleRequestSpecifier(cx, moduleRequest));
@@ -622,17 +689,22 @@ static JSObject *lookup_module(JSContext *cx, JS::HandleObject moduleRequest,
     if (g_modules) {
         auto it = g_modules->find(resolved);
         if (it != g_modules->end()) {
-            return it->second->get();
+            return compile_module_entry(cx, resolved, it->second,
+                                        JS::GetModuleRequestType(cx, moduleRequest));
         }
     }
+    g_missing_modules.push_back(resolved);
     JS_ReportErrorUTF8(cx, "module not registered: %s", resolved.c_str());
     return nullptr;
 }
 
 static bool load_module_resolved(JSContext *cx, JS::Handle<JS::Value> hostDefined) {
-    (void)cx;
-    (void)hostDefined;
-    return true;
+    /* Mirrors the shell's ModuleLoader::LoadResolved: once a dynamically
+     * imported module's dependency graph is loaded, LINK it. Without this the
+     * engine later finds the record in an unexpected state ("module record
+     * has unexpected status: Evaluating" on self-importing modules). */
+    JS::RootedObject module(cx, &hostDefined.toObject());
+    return JS::ModuleLink(cx, module);
 }
 
 static bool load_module_rejected(JSContext *cx, JS::Handle<JS::Value> hostDefined,
@@ -641,6 +713,19 @@ static bool load_module_rejected(JSContext *cx, JS::Handle<JS::Value> hostDefine
     /* Re-raise so the caller's take_error sees the real reason. */
     JS_SetPendingException(cx, error);
     return true;
+}
+
+/* HostGetImportMetaProperties: this embedding defines one property, url —
+ * the module's registry specifier (its module private). */
+static bool module_metadata(JSContext *cx, JS::Handle<JS::Value> privateValue,
+                            JS::Handle<JSObject *> metaObject) {
+    JS::RootedValue url(cx);
+    if (privateValue.isString()) {
+        url = privateValue;
+    } else {
+        url = JS::StringValue(JS_GetEmptyString(cx));
+    }
+    return JS_DefineProperty(cx, metaObject, "url", url, JSPROP_ENUMERATE);
 }
 
 /* HostLoadImportedModule: serves BOTH static imports (during
@@ -692,11 +777,11 @@ std::string js_module_register(uint64_t h, const char *specifier_p, uint32_t spe
     }
     g_stdout.clear();
     g_stderr.clear();
-    JS::RootedObject global(g_cx, g_global->get());
-    JSAutoRealm ar(g_cx, global);
-    if (!compile_and_register_module(g_cx, specifier, src)) {
-        return make_result(false, "", take_error(g_cx));
-    }
+    /* Source only; compilation is deferred to the first import so a compile
+     * error surfaces there with its real type (SyntaxError for script-only
+     * source, per HostLoadImportedModule), and so the same source can serve
+     * as JS or JSON depending on the request's import attributes. */
+    register_module_source(specifier, src);
     return make_result(true, "registered", "");
 }
 
@@ -914,11 +999,12 @@ struct AgentState {
      *    which the Go side implements with channels); broadcast, leaving and
      *    shutdown bump-and-notify it. No sleep loops.
      *  - threads/contexts track every live agent so js_close can wake each
-     *    one (JS_RequestInterruptCallbackCanWait reaches even an agent parked
+     *    one (the URGENT interrupt reaches even an agent parked
      *    inside the engine) and JOIN it before the runtime dies. An agent
      *    outliving its interpreter used to touch a destroyed runtime. */
     std::atomic<uint32_t> epoch{0};
     std::atomic<bool> shutdown{false};
+    std::atomic<uint32_t> alive{0}; /* running agent threads; futex-signaled on exit */
     std::vector<pthread_t> threads;
     std::vector<JSContext *> contexts;
 
@@ -933,6 +1019,10 @@ struct AgentState {
 };
 
 static AgentState g_agents;
+
+static bool agents_shutting_down() {
+    return g_agents.shutdown.load(std::memory_order_seq_cst);
+}
 
 /* Bump the event epoch and wake every agent parked on it. Called on
  * broadcast, on leaving, and on shutdown. */
@@ -1175,6 +1265,15 @@ static void *agent_thread_main(void *arg) {
     /* Blocking in Atomics.wait is what an agent is FOR; without this the
      * engine throws "waiting is not allowed on this thread". */
     JS_SetFutexCanWait(cx);
+    /* Interrupt callbacks are PER CONTEXT: without one here, js_close's
+     * urgent interrupt wakes an agent parked in Atomics.wait but nothing
+     * terminates it — the wait just resumes for its remaining timeout, and
+     * an infinite wait would make close hang forever. */
+    if (!JS_AddInterruptCallback(cx, interrupt_cb)) {
+        agent_milestone("interrupt callback FAILED");
+        JS_DestroyContext(cx);
+        return nullptr;
+    }
     {
         std::lock_guard<std::mutex> lock(g_agents.mu);
         g_agents.contexts.push_back(cx);
@@ -1282,6 +1381,10 @@ static void *agent_thread_main(void *arg) {
     }
     JS_DestroyContext(cx);
     t_timers = &g_timers;
+    /* Last: js_close's shutdown loop parks on the event futex until alive
+     * hits zero; the notify is what releases it. */
+    g_agents.alive.fetch_sub(1, std::memory_order_seq_cst);
+    agent_event_notify_all();
     return nullptr;
 }
 
@@ -1298,7 +1401,11 @@ static bool agent_start(JSContext *cx, unsigned argc, JS::Value *vp) {
     auto *start = new AgentStart{std::string(utf8.get())};
 
     pthread_t tid;
+    /* Incremented BEFORE create: the agent may run to completion (and
+     * decrement) before pthread_create even returns here. */
+    g_agents.alive.fetch_add(1, std::memory_order_seq_cst);
     if (pthread_create(&tid, nullptr, agent_thread_main, start) != 0) {
+        g_agents.alive.fetch_sub(1, std::memory_order_seq_cst);
         delete start;
         JS_ReportErrorASCII(cx, "$262.agent.start: could not spawn an agent");
         return false;
@@ -1480,6 +1587,7 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
     /* Module loading is registry-backed (see js.h): the hook serves both
      * static imports and dynamic import() from what the host registered. */
     JS::SetModuleLoadHook(JS_GetRuntime(g_cx), load_imported_module);
+    JS::SetModuleMetadataHook(JS_GetRuntime(g_cx), module_metadata);
 
     if (!JS_AddInterruptCallback(g_cx, interrupt_cb)) {
         JS_DestroyContext(g_cx);
@@ -1618,19 +1726,46 @@ void js_close(uint64_t h) {
     /* Deterministic agent shutdown, then JOIN: an agent outliving this
      * runtime would touch a destroyed agent cluster (SAB waiter list,
      * off-thread promise state). shutdown+notify wakes agents parked on the
-     * event futex; the CanWait interrupt reaches ones parked inside the
+     * event futex; the urgent interrupt reaches ones parked inside the
      * engine (Atomics.wait, RunJobs' internal drain). */
     {
+        g_agents.shutdown.store(true, std::memory_order_seq_cst);
+        /* RE-SIGNAL until every agent has exited, parking on the event futex
+         * (50 ms bound) between rounds. One shot is not enough: the
+         * urgent interrupt only WAKES a wait in progress — fired in the window
+         * between an agent's last loop-head check and its Atomics.wait
+         * entry, it is recorded but wakes nothing, and the wait (infinite,
+         * for a hostile guest) would never end. Each round re-fires the
+         * idempotent interrupt, so an agent inside a wait is terminated by
+         * the next round at the latest; the futex wait returns early the
+         * moment any agent exits (they bump-and-notify on the way out). */
+        while (g_agents.alive.load(std::memory_order_seq_cst) != 0) {
+            {
+                std::lock_guard<std::mutex> lock(g_agents.mu);
+                for (JSContext *acx : g_agents.contexts) {
+                    /* URGENT, not CanWait: only CallbackUrgent takes the
+                     * futex lock and wakes a wait in progress
+                     * (JSContext::requestInterrupt); CallbackCanWait merely
+                     * sets a bit for the next poll, which a parked agent
+                     * never reaches. */
+                    JS_RequestInterruptCallback(acx);
+                }
+            }
+            agent_event_notify_all();
+            /* seen AFTER the bump above, or the wait below would return
+             * immediately every round; an agent exiting in between bumps
+             * again, so the compare-and-park still cannot miss it. */
+            uint32_t seen = g_agents.epoch.load(std::memory_order_seq_cst);
+            if (g_agents.alive.load(std::memory_order_seq_cst) == 0) {
+                break;
+            }
+            agent_event_wait(seen, 50 * 1000 * 1000);
+        }
         std::vector<pthread_t> threads;
         {
             std::lock_guard<std::mutex> lock(g_agents.mu);
-            g_agents.shutdown.store(true, std::memory_order_seq_cst);
             threads = g_agents.threads;
-            for (JSContext *acx : g_agents.contexts) {
-                JS_RequestInterruptCallbackCanWait(acx);
-            }
         }
-        agent_event_notify_all();
         for (pthread_t t : threads) {
             pthread_join(t, nullptr);
         }
@@ -1647,11 +1782,13 @@ void js_close(uint64_t h) {
     /* Persistent roots must be released while their runtime is still alive. */
     if (g_modules) {
         for (auto &entry : *g_modules) {
-            delete entry.second;
+            delete entry.second.js;
+            delete entry.second.json;
         }
         delete g_modules;
         g_modules = nullptr;
     }
+    g_missing_modules.clear();
     delete g_global;
     g_global = nullptr;
     JS_DestroyContext(g_cx);
