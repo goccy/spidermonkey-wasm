@@ -700,10 +700,14 @@ static JSObject *lookup_module(JSContext *cx, JS::HandleObject moduleRequest,
 
 static bool load_module_resolved(JSContext *cx, JS::Handle<JS::Value> hostDefined) {
     /* Mirrors the shell's ModuleLoader::LoadResolved: once a dynamically
-     * imported module's dependency graph is loaded, LINK it. Without this the
-     * engine later finds the record in an unexpected state ("module record
-     * has unexpected status: Evaluating" on self-importing modules). */
+     * imported module's dependency graph is loaded, LINK it — but only when
+     * it still needs linking. Spec Link (16.2.1.5.1) THROWS for a module in
+     * Linking/Evaluating status, and a SELF-importing module is Evaluating at
+     * exactly this moment; it is already linked, so skip. */
     JS::RootedObject module(cx, &hostDefined.toObject());
+    if (JS::ModuleIsLinked(module)) {
+        return true;
+    }
     return JS::ModuleLink(cx, module);
 }
 
@@ -759,8 +763,14 @@ static bool load_imported_module(JSContext *cx, JS::Handle<JSScript *> referrer,
             JS_IsExceptionPending(cx)) {
             return JS::FinishLoadingImportedModuleFailedWithPendingException(cx, payload);
         }
+        /* usePromise: continue the dynamic import from a promise JOB, not
+         * synchronously inside this hook. A module importing ITSELF is
+         * Evaluating right now; the spec only reaches ContinueDynamicImport
+         * after the current evaluation job, when the status is Evaluated —
+         * continuing synchronously evaluates an Evaluating record and dies
+         * with "module record has unexpected status". */
         return JS::FinishLoadingImportedModule(cx, nullptr, moduleRequest, payload, module,
-                                               /* usePromise = */ false);
+                                               /* usePromise = */ true);
     }
     return JS::FinishLoadingImportedModule(cx, referrer, moduleRequest, payload, module,
                                            /* usePromise = */ false);
