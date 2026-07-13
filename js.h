@@ -76,9 +76,12 @@ std::string js_eval(uint64_t h, const char *src, uint32_t src_len);
  * Dispatchables another agent has queued — Atomics.waitAsync resolutions
  * arrive this way). Returns the same {ok, result, error} envelope as js_eval;
  * result is "1" if the pump made progress (output was produced or a job ran),
- * "0" if the queue was empty. stdout/stderr produced by the drained jobs is
- * captured exactly like js_eval's. The host loops on this to run an event
- * loop; the engine has no loop of its own. */
+ * "2" if nothing ran but work is still pending (a timer not yet due, or an
+ * engine-delayed Atomics.waitAsync timeout) — wait briefly and pump again —
+ * and "0" if nothing ran and nothing is pending, so the loop can stop.
+ * stdout/stderr produced by the drained jobs is captured exactly like
+ * js_eval's. The host loops on this to run an event loop; the engine has no
+ * loop of its own. */
 std::string js_pump_jobs(uint64_t h);
 
 /* ---- ES modules ------------------------------------------------------------

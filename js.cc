@@ -1547,7 +1547,18 @@ std::string js_pump_jobs(uint64_t h) {
         return make_result(false, "", take_error(g_cx));
     }
     bool progressed = ran || !g_stdout.empty() || !g_stderr.empty();
-    return make_result(true, progressed ? "1" : "0", "");
+    /* Three-way result so the host's event loop can be exact instead of
+     * guessing: "1" = work ran; "2" = nothing ran but work is PENDING (a
+     * host timer not yet due, or an engine-delayed dispatchable — an
+     * Atomics.waitAsync timeout — still queued), so wait and pump again;
+     * "0" = nothing ran and nothing pending: the loop can stop. */
+    bool pending = host_timers_pending(&g_timers);
+#ifdef SPIDERMONKEY_WASM_THREADS
+    if (!pending) {
+        pending = js::Wasm2GoEarliestDelayedDispatchMs(g_cx) >= 0;
+    }
+#endif
+    return make_result(true, progressed ? "1" : (pending ? "2" : "0"), "");
 }
 
 std::string js_eval(uint64_t h, const char *src, uint32_t src_len) {
