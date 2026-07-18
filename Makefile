@@ -3,7 +3,10 @@
 # declaring the import path its own `import` / `//go:linkname` sites embed.
 # wasmify writes that path into wasmify.json's bridge.Wasm2GoImportPath, which
 # the codegen reads back; derive it from the JSON so the two never drift.
-WASM2GO_BUNDLE_DIR    := build/wasm2go/internal/wasm2go
+# The bundle is emitted at <bridge-dir>/internal/wasm2go. The bridge's Go
+# package is github.com/goccy/go-spidermonkey/internal, so its dir is
+# build/wasm2go/internal and the bundle nests one level deeper.
+WASM2GO_BUNDLE_DIR    := build/wasm2go/internal/internal/wasm2go
 WASM2GO_BUNDLE_GO_VER := 1.25.0
 
 # The full pipeline, top to bottom. Unlike python-wasm's, this one runs on the
