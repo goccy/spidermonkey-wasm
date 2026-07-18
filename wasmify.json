@@ -74,22 +74,44 @@
       "js.cc",
       "starlingmonkey/crates/rust-hooks/src/wrappers.cpp"
     ],
-    "GoPackage": "github.com/goccy/go-spidermonkey;spidermonkey",
+    "GoPackage": "github.com/goccy/go-spidermonkey/internal;internal",
     "Wasm2GoImportPath": "github.com/goccy/spidermonkeywasm2go",
+    "HostThreads": true,
+    "MaxMemoryPages": 4096,
     "StackSize": 8388608,
     "ExportFunctions": [
       "js_new",
       "js_eval",
+      "js_agent_spawn",
+      "js_agent_wake",
+      "js_clone_write",
+      "js_clone_read",
+      "js_clone_free",
+      "js_gc",
+      "js_detach_array_buffer",
+      "js_new_realm",
+      "js_eval_in",
+      "js_new_htmldda",
+      "js_eval_module",
+      "js_global",
+      "js_new_plain_object",
+      "js_define_function",
+      "js_define_constructor",
+      "js_free_object",
+      "js_get",
+      "js_set",
+      "js_call",
       "js_close",
       "js_interrupt_addr",
       "js_interrupt_bits_addr",
-      "js_interrupt_bits_value"
+      "js_interrupt_bits_value",
+      "js_run_jobs"
     ]
   },
   "wasm_build": {
     "prebuilt_archives": [
       "deps/spidermonkey/libspidermonkey.a",
-      "rust/target/wasm32-wasip1/release/libspidermonkey_rust.a"
+      "deps/spidermonkey/libjsrust.a"
     ],
     "extra_cxxflags": [
       "-std=gnu++20",
@@ -97,11 +119,12 @@
       "-fno-exceptions",
       "-fno-sized-deallocation",
       "-fno-aligned-new",
-      "-mthread-model",
-      "single",
       "-Wno-invalid-offsetof",
       "-Wno-unknown-warning-option",
-      "-Wno-unused-result"
+      "-Wno-unused-result",
+      "-DSPIDERMONKEY_WASM_THREADS",
+      "-matomics",
+      "-mbulk-memory"
     ],
     "bridge_extra_includes": [
       "deps/spidermonkey/include"
@@ -113,7 +136,7 @@
   },
   "phases": {
     "gen-proto": {
-      "completed_at": "2026-07-10T14:35:10Z",
+      "completed_at": "2026-07-17T13:50:36Z",
       "upstream_commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
       "output_files": [
         "proto/spidermonkey.proto",
@@ -123,7 +146,7 @@
       ]
     },
     "parse-headers": {
-      "completed_at": "2026-07-10T14:35:10Z",
+      "completed_at": "2026-07-17T04:33:20Z",
       "upstream_commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
       "output_files": [
         "api-spec.json"
