@@ -11,8 +11,9 @@ name: release
 # alongside):
 #   * spidermonkey.wasm            — raw wasi-sdk artifact (binaryen-optimised).
 #   * spidermonkey_wasm2go.go      — protoc-gen-wasmify-go's wasm2go bridge.
-#   * spidermonkey_wasm2go.tar.gz  — the build/wasm2go/internal/wasm2go bundle, a
-#                                    self-contained Go module after bundle-gomod,
+#   * spidermonkey_wasm2go.tar.gz  — the github.com/goccy/spidermonkeywasm2go
+#                                    module (build/wasm2go/internal/internal/
+#                                    wasm2go), self-contained after bundle-gomod,
 #                                    which go-spidermonkey downloads and extracts.
 #   * spidermonkey_wasm2go.sha256  — sha256sum manifest of the tarball contents;
 #                                    doubles as the attestation subject-checksums
@@ -66,8 +67,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/spidermonkey-static-intl-release.tar.gz
-          key: engine-intl-${{ runner.os }}-${{ hashFiles('scripts/build-engine-intl.sh', 'starlingmonkey/cmake/spidermonkey.cmake') }}
-      - name: Build engine with Intl
+          # -threads keys this to the wasi-threads flavor: the bundle links with
+          # --shared-memory, so every object (jsrust included) must carry
+          # atomics+bulk-memory. Matches build.yml.
+          key: engine-intl-threads-${{ runner.os }}-${{ hashFiles('scripts/build-engine-intl.sh', 'starlingmonkey/cmake/spidermonkey.cmake') }}
+      - name: Build engine with Intl (wasi-threads)
+        env:
+          SPIDERMONKEY_THREADS: "1"
         run: |
           if [ ! -f build/spidermonkey-static-intl-release.tar.gz ]; then
             bash scripts/build-engine-intl.sh
@@ -144,12 +150,20 @@ jobs:
         run: |
           mkdir -p release
           cp .wasmify/wasm-build/output/spidermonkey.wasm release/spidermonkey.wasm
-          cp build/wasm2go/spidermonkey.go release/spidermonkey_wasm2go.go
-          tar -czf release/spidermonkey_wasm2go.tar.gz -C build/wasm2go/internal/wasm2go .
-          ( cd build/wasm2go/internal/wasm2go && find . -type f -print0 | sort -z \
+          # The generated bridge (package `internal`): go-spidermonkey commits it
+          # at internal/spidermonkey.go. buf writes it under the go_package dir,
+          # so it is build/wasm2go/internal/spidermonkey.go, not the out root.
+          cp build/wasm2go/internal/spidermonkey.go release/spidermonkey_wasm2go.go
+          # The wasm2go runtime is its own module (github.com/goccy/
+          # spidermonkeywasm2go); tar its contents so extraction yields the
+          # module AT ITS ROOT. Its on-disk build/wasm2go/internal/internal/
+          # wasm2go location is just where buf dumps it under the go_package dir.
+          bundle=build/wasm2go/internal/internal/wasm2go
+          tar -czf release/spidermonkey_wasm2go.tar.gz -C "$bundle" .
+          ( cd "$bundle" && find . -type f -print0 | sort -z \
               | xargs -0 sha256sum ) > release/spidermonkey_wasm2go.sha256
           # The bundle is only usable as a Go module; bundle-gomod must have run.
-          test -f build/wasm2go/internal/wasm2go/go.mod \
+          test -f "$bundle/go.mod" \
             || { echo "::error::bundle go.mod missing — make bundle-gomod did not run"; exit 1; }
 
       - uses: actions/attest-build-provenance@v2
