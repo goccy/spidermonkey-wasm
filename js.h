@@ -165,6 +165,41 @@ std::string js_set(uint64_t h, uint64_t obj_handle, const char *name, uint32_t n
 std::string js_call(uint64_t h, uint64_t fn_handle, uint64_t this_handle, const char *args,
                     uint32_t args_len);
 
+/* A fresh host-backed FUNCTION object, attached to nothing: calling it from JS
+ * dispatches to the Go function the embedder registered under `key`, exactly
+ * like a js_define_function stub, but the function is returned as a handle
+ * instead of being defined as a property. This is the Go-side FuncOf: the
+ * embedder composes it into any structure (a callback argument, an
+ * underlyingSource.pull, an object method) via js_set / js_call /
+ * js_construct. Returns 0 on failure. */
+uint64_t js_new_function(uint64_t h, const char *name, uint32_t name_len, const char *key,
+                         uint32_t key_len, uint32_t nargs);
+
+/* Construct `new fn(...args)` — the [[Construct]] counterpart of js_call
+ * (fn_handle must be a constructor: a class or function). args is the same
+ * JSON array of value encodings; the return is the new instance's value
+ * encoding ({"k":"error",...} when construction threw). */
+std::string js_construct(uint64_t h, uint64_t fn_handle, const char *args, uint32_t args_len);
+
+/* ---- raw bytes -------------------------------------------------------------
+ * Binary data crosses the bridge RAW: the generated protobuf channel is
+ * length-delimited and 8-bit clean in both directions (explicit lengths,
+ * never strlen), so bytes — including NULs and non-UTF-8 sequences — need no
+ * base64/JSON encoding. These two functions are the []byte <-> Uint8Array
+ * fast path a host binary API is built on. */
+
+/* Create a fresh Uint8Array of data_len bytes initialized with a copy of
+ * `data`, and return it as an object handle (0 on failure). The copy happens
+ * inside this call, so no engine data pointer ever crosses the bridge. */
+uint64_t js_bytes_new(uint64_t h, const char *data, uint32_t data_len);
+
+/* Copy the binary contents of obj_handle out of the engine: a Uint8Array or
+ * any other ArrayBuffer view (read as its raw bytes, honoring offset/length),
+ * an ArrayBuffer, or a SharedArrayBuffer. Returns 'B' + the bytes on success,
+ * or 'E' + message when the object is not binary (the one-byte tag
+ * disambiguates an empty buffer from an error). */
+std::string js_bytes_read(uint64_t h, uint64_t obj_handle);
+
 /* ---- agents ----------------------------------------------------------------
  *
  * ECMA-262 specifies what an agent IS (its own thread of execution and realm,
