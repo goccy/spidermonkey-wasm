@@ -30,6 +30,7 @@
 
 #include <js/Array.h>
 #include <js/ArrayBuffer.h>
+#include <js/experimental/TypedData.h>
 #include <js/HelperThreadAPI.h>
 #include <js/SharedArrayBuffer.h>
 #include <js/StructuredClone.h>
@@ -375,7 +376,15 @@ static bool host_func_call(JSContext *cx, unsigned argc, JS::Value *vp) {
     if (!nameUtf8) {
         return false;
     }
-    std::string name(nameUtf8.get());
+    /* Take the ENCODED length, not strlen: a dispatch key may legally contain
+     * NUL bytes (the host's reserved-key namespace is NUL-prefixed precisely
+     * so guest-visible names can never collide with it), and the C-string
+     * constructor would silently truncate the key to "" at the first one. */
+    JSLinearString *nameLin = JS_EnsureLinearString(cx, nameStr);
+    if (!nameLin) {
+        return false;
+    }
+    std::string name(nameUtf8.get(), JS::GetDeflatedUTF8StringLength(nameLin));
 
     /* Arguments as a JSON array of value ENCODINGS — primitives carry their
      * data, objects and functions carry a persistent handle. JSON.stringify
@@ -1123,6 +1132,37 @@ std::string js_get(uint64_t h, uint64_t obj_handle, const char *name_p, uint32_t
 
 /* Call the callable fn_handle with this_handle (0 = undefined) and args (a Go
  * JSON array of value encodings); return the result as a value encoding. */
+/* Decode a JSON array of value encodings into live call arguments — shared by
+ * js_call and js_construct. Returns "" on success, or the error encoding to
+ * reply with. */
+static std::string decode_call_args(JSContext *cx, const char *args_p, uint32_t args_len,
+                                    JS::RootedValueVector &out) {
+    if (args_len == 0) {
+        return "";
+    }
+    JS::RootedValue argsArr(cx);
+    if (!parse_json_utf8(cx, args_p, args_len, &argsArr) || !argsArr.isObject()) {
+        return "{\"k\":\"error\",\"v\":\"undecodable call arguments\"}";
+    }
+    JS::RootedObject arr(cx, &argsArr.toObject());
+    uint32_t len = 0;
+    if (!JS::GetArrayLength(cx, arr, &len)) {
+        return "{\"k\":\"error\",\"v\":\"undecodable call arguments\"}";
+    }
+    for (uint32_t i = 0; i < len; i++) {
+        JS::RootedValue el(cx);
+        if (!JS_GetElement(cx, arr, i, &el)) {
+            return "{\"k\":\"error\",\"v\":\"undecodable call arguments\"}";
+        }
+        JS::RootedValue dec(cx);
+        decode_js_value(cx, el, &dec);
+        if (!out.append(dec)) {
+            return "{\"k\":\"error\",\"v\":\"out of memory\"}";
+        }
+    }
+    return "";
+}
+
 std::string js_call(uint64_t h, uint64_t fn_handle, uint64_t this_handle, const char *args_p,
                     uint32_t args_len) {
     Runtime *rt = rt_from(h);
@@ -1141,33 +1181,60 @@ std::string js_call(uint64_t h, uint64_t fn_handle, uint64_t this_handle, const 
         }
     }
     JS::RootedValueVector callArgs(rt->cx);
-    if (args_len > 0) {
-        JS::RootedValue argsArr(rt->cx);
-        if (!parse_json_utf8(rt->cx, args_p, args_len, &argsArr) || !argsArr.isObject()) {
-            return "{\"k\":\"error\",\"v\":\"undecodable call arguments\"}";
-        }
-        JS::RootedObject arr(rt->cx, &argsArr.toObject());
-        uint32_t len = 0;
-        if (!JS::GetArrayLength(rt->cx, arr, &len)) {
-            return "{\"k\":\"error\",\"v\":\"undecodable call arguments\"}";
-        }
-        for (uint32_t i = 0; i < len; i++) {
-            JS::RootedValue el(rt->cx);
-            if (!JS_GetElement(rt->cx, arr, i, &el)) {
-                return "{\"k\":\"error\",\"v\":\"undecodable call arguments\"}";
-            }
-            JS::RootedValue dec(rt->cx);
-            decode_js_value(rt->cx, el, &dec);
-            if (!callArgs.append(dec)) {
-                return "{\"k\":\"error\",\"v\":\"out of memory\"}";
-            }
-        }
+    if (std::string err = decode_call_args(rt->cx, args_p, args_len, callArgs); !err.empty()) {
+        return err;
     }
     JS::RootedValue fnVal(rt->cx, JS::ObjectValue(*fnObj));
     JS::RootedValue rval(rt->cx);
     if (!JS::Call(rt->cx, thisVal, fnVal, callArgs, &rval)) {
         return encode_error(rt->cx);
     }
+    std::string out;
+    encode_js_value(rt->cx, rval, out);
+    return out;
+}
+
+/* A fresh host-backed function object (see js.h): a js_define_function stub
+ * returned as a handle instead of being defined as a property. */
+uint64_t js_new_function(uint64_t h, const char *name_p, uint32_t name_len, const char *key_p,
+                         uint32_t key_len, uint32_t nargs) {
+    Runtime *rt = rt_from(h);
+    if (!rt || !rt->cx) {
+        return 0;
+    }
+    JS::RootedObject global(rt->cx, rt->global->get());
+    JSAutoRealm ar(rt->cx, global);
+    const std::string name(name_p ? name_p : "", name_p ? name_len : 0);
+    const std::string key(key_p ? key_p : "", key_p ? key_len : 0);
+    JS::RootedObject fnObj(rt->cx, new_host_stub(rt->cx, key, name, nargs, 0, host_func_call));
+    if (!fnObj) {
+        JS_ClearPendingException(rt->cx);
+        return 0;
+    }
+    return new_obj_handle(rt->cx, fnObj);
+}
+
+/* Construct `new fn(...args)` — js_call's [[Construct]] counterpart. */
+std::string js_construct(uint64_t h, uint64_t fn_handle, const char *args_p, uint32_t args_len) {
+    Runtime *rt = rt_from(h);
+    if (!rt || !rt->cx) {
+        return "{\"k\":\"undefined\"}";
+    }
+    JS::RootedObject fnObj(rt->cx, obj_from_handle(fn_handle));
+    if (!fnObj || !JS::IsConstructor(fnObj)) {
+        return "{\"k\":\"error\",\"v\":\"not a constructor\"}";
+    }
+    JSAutoRealm ar(rt->cx, fnObj);
+    JS::RootedValueVector callArgs(rt->cx);
+    if (std::string err = decode_call_args(rt->cx, args_p, args_len, callArgs); !err.empty()) {
+        return err;
+    }
+    JS::RootedValue fnVal(rt->cx, JS::ObjectValue(*fnObj));
+    JS::RootedObject instance(rt->cx);
+    if (!JS::Construct(rt->cx, fnVal, callArgs, &instance)) {
+        return encode_error(rt->cx);
+    }
+    JS::RootedValue rval(rt->cx, JS::ObjectValue(*instance));
     std::string out;
     encode_js_value(rt->cx, rval, out);
     return out;
@@ -1379,6 +1446,71 @@ std::string js_detach_array_buffer(uint64_t h, uint64_t obj_handle) {
         return encode_error(rt->cx);
     }
     return "{\"k\":\"undefined\"}";
+}
+
+/* Create a fresh Uint8Array holding a copy of data. The copy happens entirely
+ * inside this call — JS_GetUint8ArrayData's pointer is used under
+ * AutoCheckCannotGC and never crosses the bridge — so inline (GC-movable)
+ * array data is safe. */
+uint64_t js_bytes_new(uint64_t h, const char *data, uint32_t data_len) {
+    Runtime *rt = rt_from(h);
+    if (!rt || !rt->cx) {
+        return 0;
+    }
+    JS::RootedObject global(rt->cx, rt->global->get());
+    JSAutoRealm ar(rt->cx, global);
+    JS::RootedObject arr(rt->cx, JS_NewUint8Array(rt->cx, data_len));
+    if (!arr) {
+        JS_ClearPendingException(rt->cx);
+        return 0;
+    }
+    if (data_len > 0) {
+        JS::AutoCheckCannotGC nogc;
+        bool is_shared = false;
+        uint8_t *dst = JS_GetUint8ArrayData(arr, &is_shared, nogc);
+        if (!dst) {
+            return 0;
+        }
+        memcpy(dst, data, data_len);
+    }
+    return new_obj_handle(rt->cx, arr);
+}
+
+/* Copy the binary contents of obj_handle into the reply ('B' + bytes, or 'E' +
+ * message). The engine-side data pointer is only dereferenced here, before any
+ * further JSAPI call, so GC cannot move the data out from under the copy. */
+std::string js_bytes_read(uint64_t h, uint64_t obj_handle) {
+    Runtime *rt = rt_from(h);
+    if (!rt || !rt->cx) {
+        return "Eno runtime";
+    }
+    JSObject *obj = obj_from_handle(obj_handle);
+    if (!obj) {
+        return "Einvalid object handle";
+    }
+    size_t length = 0;
+    bool is_shared = false;
+    uint8_t *data = nullptr;
+    JS::AutoCheckCannotGC nogc;
+    if (JS_GetObjectAsArrayBufferView(obj, &length, &is_shared, &data)) {
+        /* Any view — Uint8Array, other typed arrays, DataView — read as its
+         * raw byte window (offset/length already applied). */
+    } else if (JS::IsArrayBufferObject(obj)) {
+        length = JS::GetArrayBufferByteLength(obj);
+        data = JS::GetArrayBufferData(obj, &is_shared, nogc);
+    } else if (JS::IsSharedArrayBufferObject(obj)) {
+        length = JS::GetSharedArrayBufferByteLength(obj);
+        data = JS::GetSharedArrayBufferData(obj, &is_shared, nogc);
+    } else {
+        return "Evalue is not an ArrayBuffer or ArrayBuffer view";
+    }
+    std::string out;
+    out.reserve(length + 1);
+    out += 'B';
+    if (data && length > 0) {
+        out.append(reinterpret_cast<const char *>(data), length);
+    }
+    return out;
 }
 
 /* Create a fresh SAME-COMPARTMENT realm (objects flow between realms directly,

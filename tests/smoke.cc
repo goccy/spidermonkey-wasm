@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 /* js.cc reaches the host over two env imports (go_host_call/go_host_result):
@@ -156,6 +157,34 @@ int main() {
     js_gc(h);
     r = js_eval(h, "1 + 1");
     check(result_num(r, "2"), "engine evaluates after js_gc");
+
+    // --- raw bytes bridge ----------------------------------------------------
+    // js_bytes_new / js_bytes_read carry binary payloads with no encoding;
+    // NULs and high bytes must survive both directions, and the created
+    // handle must be a real script-visible Uint8Array.
+    {
+        const unsigned char raw[] = {0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff};
+        uint64_t bh = js_bytes_new(h, (const char *)raw, (uint32_t)sizeof raw);
+        check(bh != 0, "js_bytes_new returns a handle");
+        std::string bytes = js_bytes_read(h, bh);
+        check(bytes.size() == 1 + sizeof raw && bytes[0] == 'B' &&
+                  std::memcmp(bytes.data() + 1, raw, sizeof raw) == 0,
+              "js_bytes_read round-trips NUL and high bytes");
+        uint64_t g = js_global(h);
+        const std::string enc = "{\"k\":\"object\",\"h\":" + std::to_string(bh) + "}";
+        js_set(h, g, "hb", 2, enc.c_str(), (uint32_t)enc.size());
+        r = js_eval(h, "hb instanceof Uint8Array && hb.join(',') === '0,1,127,128,254,255'");
+        check(result_bool(r, "true"), "js_bytes_new array is a script-visible Uint8Array");
+        std::string not_binary = js_bytes_read(h, g);
+        check(!not_binary.empty() && not_binary[0] == 'E',
+              "js_bytes_read rejects a non-binary object");
+        js_free_object(bh);
+        js_free_object(g);
+        uint64_t empty = js_bytes_new(h, nullptr, 0);
+        check(empty != 0 && js_bytes_read(h, empty) == "B",
+              "zero-length payload round-trips as an empty Uint8Array");
+        js_free_object(empty);
+    }
 
     // Intl availability must match how the engine archive was built:
     // SPIDERMONKEY_WASM_EXPECT_INTL=1 for --with-intl-api builds (see

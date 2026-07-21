@@ -101,6 +101,10 @@
       "js_get",
       "js_set",
       "js_call",
+      "js_new_function",
+      "js_construct",
+      "js_bytes_new",
+      "js_bytes_read",
       "js_close",
       "js_interrupt_addr",
       "js_interrupt_bits_addr",
@@ -136,7 +140,7 @@
   },
   "phases": {
     "gen-proto": {
-      "completed_at": "2026-07-17T13:50:36Z",
+      "completed_at": "2026-07-21T06:45:06Z",
       "upstream_commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
       "output_files": [
         "proto/spidermonkey.proto",
@@ -146,7 +150,7 @@
       ]
     },
     "parse-headers": {
-      "completed_at": "2026-07-17T04:33:20Z",
+      "completed_at": "2026-07-21T06:45:05Z",
       "upstream_commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
       "output_files": [
         "api-spec.json"
