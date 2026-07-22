@@ -134,6 +134,24 @@ grep -q '__wasm32__' "$f" || {
     exit 1
 }
 
+# Portable baseline interpreter: upstream compiles its interrupt checks OUT
+# on __wasi__ ("with a single thread, there is no possibility for an
+# interrupt to come asynchronously") — but this embedding delivers
+# interrupts exactly that way: the HOST stores JSContext::interruptBits_
+# into linear memory while the guest runs (js.cc discover_interrupt_bits /
+# the armed fallback), from a Go goroutine under wasm2go and from another
+# thread under wasmtime. Without the checks a runaway script under PBL is
+# unstoppable: js_eval cancellation and js_close both hang. Keep the checks
+# on wasi; the cost is the same per-loop-head flag load js::Interpret pays.
+f=$SRC/js/src/vm/PortableBaselineInterpret.cpp
+if ! grep -q 'interrupt checks stay ON for wasi' "$f"; then
+    perl -0pi -e 's|// Whether to compile in interrupt checks in the main interpreter loop\.\n#ifndef __wasi__\n// On WASI, with a single thread, there is no possibility for an\n// interrupt to come asynchronously\.\n#  define ENABLE_INTERRUPT_CHECKS\n#endif|// Whether to compile in interrupt checks in the main interpreter loop.\n// [spidermonkey-wasm] interrupt checks stay ON for wasi: the embedding\n// stores JSContext::interruptBits_ into linear memory from the host while\n// the guest runs, so asynchronous interrupts DO happen here.\n#define ENABLE_INTERRUPT_CHECKS|' "$f"
+fi
+grep -q 'interrupt checks stay ON for wasi' "$f" || {
+    echo "error: wasi PBL interrupt-checks patch no longer applies to $f" >&2
+    exit 1
+}
+
 
 # --- threads patches (SPIDERMONKEY_THREADS=1) --------------------------------
 # WASI's threading in gecko is hard-wired OFF: js/src/moz.build picks
