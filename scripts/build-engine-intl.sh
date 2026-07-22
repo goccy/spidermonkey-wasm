@@ -152,6 +152,45 @@ grep -q 'interrupt checks stay ON for wasi' "$f" || {
     exit 1
 }
 
+# PBL CreateSuppressedError pops its operands in the WRONG ORDER (upstream
+# bug, still present on mozilla-central as of 2026-07-22). The emitter
+# leaves [.. EXC2 EXC] with the PREVIOUS pending exception (EXC) on top —
+# js::Interpret pops top into `suppressed`, next into `error` (correct per
+# DisposeResources step 3.e.iii.1) — but PBL pops top into `error`, so
+# every SuppressedError chain built under PBL is inverted. test262
+# regressions: built-ins/DisposableStack/.../throws-suppressederror-*,
+# language/statements/using/throws-suppressederror-*, and the staging
+# explicit-resource-management ordering tests. Swap the pops to match
+# js::Interpret. Upstreamable.
+f=$SRC/js/src/vm/PortableBaselineInterpret.cpp
+if ! grep -q 'pops suppressed first, matching js::Interpret' "$f"; then
+    perl -0pi -e 's|          ReservedRooted<JS::Value> error\(&state\.value0, VIRTPOP\(\)\.asValue\(\)\);\n          ReservedRooted<JS::Value> suppressed\(&state\.value1,\n                                               VIRTPOP\(\)\.asValue\(\)\);|          // [spidermonkey-wasm] pops suppressed first, matching js::Interpret:\n          // top of stack is the PREVIOUS pending exception (the suppressed\n          // one); popping it into `error` inverts every SuppressedError chain.\n          ReservedRooted<JS::Value> suppressed(\&state.value1,\n                                               VIRTPOP().asValue());\n          ReservedRooted<JS::Value> error(\&state.value0, VIRTPOP().asValue());|' "$f"
+fi
+grep -q 'pops suppressed first, matching js::Interpret' "$f" || {
+    echo "error: PBL CreateSuppressedError operand-order patch no longer applies to $f" >&2
+    exit 1
+}
+
+# Error-message decompilation: when DecompileExpressionFromStack cannot
+# resolve the source expression (always the case for PBL frames — the
+# expression decompiler works from interpreter-frame pc, which PBL does not
+# expose the same way), DecompileValueGenerator falls back to
+# ValueToSource(v), which INVOKES USER-OBSERVABLE HOOKS in the middle of
+# error reporting: a `toSource` property get and, for proxies, ownKeys
+# traps. A trap that throws then REPLACES the TypeError being reported
+# (test262 staging/sm/object/toPrimitive.js catches exactly this: a proxy
+# handler that throws a string on any trap but `get` turns "can't convert
+# Object to primitive" into an uncatchable-shape string throw). Describe
+# objects by class name instead — side-effect-free and deterministic;
+# primitives keep the precise source form.
+f=$SRC/js/src/vm/BytecodeUtil.cpp
+if ! grep -q 'side-effect-free description for objects' "$f"; then
+    perl -0pi -e 's|    fallback = ValueToSource\(cx, v\);\n    if \(!fallback\) \{\n      return nullptr;\n    \}\n  \}\n\n  return StringToNewUTF8CharsZ\(cx, \*fallback\);|    // [spidermonkey-wasm] side-effect-free description for objects: the\n    // ValueToSource fallback invokes toSource getters and proxy ownKeys\n    // traps during error reporting, letting user code replace the error\n    // being reported. PBL frames always take this fallback.\n    if (v.isObject()) {\n      return DuplicateString(cx, v.toObject().getClass()->name);\n    }\n    fallback = ValueToSource(cx, v);\n    if (!fallback) {\n      return nullptr;\n    }\n  }\n\n  return StringToNewUTF8CharsZ(cx, *fallback);|' "$f"
+fi
+grep -q 'side-effect-free description for objects' "$f" || {
+    echo "error: decompile-fallback patch no longer applies to $f" >&2
+    exit 1
+}
 
 # --- threads patches (SPIDERMONKEY_THREADS=1) --------------------------------
 # WASI's threading in gecko is hard-wired OFF: js/src/moz.build picks
