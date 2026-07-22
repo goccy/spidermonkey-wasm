@@ -2130,6 +2130,16 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
     rt->main_ctx.rt = rt;
     JS_SetContextPrivate(rt->cx, &rt->main_ctx);
 
+    /* The engine is built --disable-jit --enable-portable-baseline-interp,
+     * but PBL is OFF by default at runtime: without this, every script runs
+     * in the generic C++ interpreter (js::Interpret), the slowest tier.
+     * Enable PBL and enter it immediately (warm-up 0) — with no JIT tiers
+     * above it there is nothing to warm up FOR, and the generic interpreter
+     * is strictly slower. Options are process-global; set once, before
+     * InitSelfHostedCode so self-hosted code runs under PBL too. */
+    JS_SetGlobalJitCompilerOption(rt->cx, JSJITCOMPILER_PORTABLE_BASELINE_ENABLE, 1);
+    JS_SetGlobalJitCompilerOption(rt->cx, JSJITCOMPILER_PORTABLE_BASELINE_WARMUP_THRESHOLD, 0);
+
     /* Ordering below is not stylistic. Everything here has to happen before
      * JS::InitSelfHostedCode, which is the point after which the runtime counts
      * as started:
