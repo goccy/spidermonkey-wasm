@@ -39,7 +39,7 @@ permissions:
   attestations: write
 
 env:
-  WASMIFY_VERSION: v0.5.1
+  WASMIFY_VERSION: v0.5.2
 
 jobs:
   # Build the with-Intl engine from source (ICU + Temporal + shared memory +
