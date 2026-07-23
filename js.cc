@@ -2119,8 +2119,15 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
 
     /* The nursery is carved out of the heap budget, so a tiny max_heap_bytes
      * with SpiderMonkey's default nursery would leave nothing for the tenured
-     * heap. Let SpiderMonkey size it; we only clamp the total. */
-    rt->cx = JS_NewContext(max_heap_bytes ? max_heap_bytes : JS::DefaultHeapMaxBytes);
+     * heap. Let SpiderMonkey size it; we only clamp the total.
+     *
+     * max_heap_bytes == 0 means UNCAPPED on the JS side (0xffffffff, not
+     * JS::DefaultHeapMaxBytes — that default is a mere 32 MiB and starved
+     * GC-heavy guests long before the real sandbox limit): the single
+     * effective memory bound is then the wasm linear-memory cap the host
+     * configures (go-spidermonkey Config.MaxMemoryBytes). One knob, host
+     * side, by design. */
+    rt->cx = JS_NewContext(max_heap_bytes ? max_heap_bytes : 0xffffffffu);
     if (!rt->cx) {
         delete rt;
         return 0;

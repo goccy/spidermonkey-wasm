@@ -42,8 +42,9 @@
  *
  * `max_heap_bytes`, when non-zero, caps the GC heap (JSGC_MAX_BYTES): an
  * allocation past it fails with an out-of-memory error inside the guest rather
- * than growing wasm linear memory. It is the JS-visible half of the sandbox;
- * the host-side wasm memory cap (Config.MaxMemoryBytes) is the backstop.
+ * than growing wasm linear memory. Zero means uncapped on the JS side — the
+ * host-side wasm memory cap (Config.MaxMemoryBytes) is then the single
+ * effective limit, which is the supported configuration.
  *
  * `native_stack_quota_bytes`, when non-zero, caps native recursion depth
  * (JS_SetNativeStackQuota) so runaway recursion raises a catchable
