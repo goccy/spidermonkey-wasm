@@ -1918,47 +1918,18 @@ static void agent_deliver_inbox(JSContext *cx, uint64_t id, JS::HandleObject glo
 }
 
 /* One agent = one thread = one runtime. */
-static void *agent_thread_main(void *arg) {
-    std::unique_ptr<AgentStart> start(static_cast<AgentStart *>(arg));
-
-    Runtime *rt = start->rt;
-
-    /* This context's private data: its id for the reserved host calls and its
-     * print capture (which dies with it). */
-    CtxData ctxdata;
-    ctxdata.rt = rt;
-    ctxdata.agent_id = start->id;
-
-    /* Parented to the main runtime — same agent cluster, which is what makes
-     * the SharedArrayBuffer waiter list and the off-thread promise bookkeeping
-     * (both cluster-scoped) reach this agent. */
-    JSContext *cx = JS_NewContext(JS::DefaultHeapMaxBytes, rt->jsrt);
-    if (!cx) {
-        agent_milestone("JS_NewContext FAILED");
-        return nullptr;
-    }
-    JS_SetContextPrivate(cx, &ctxdata);
-    /* Blocking in Atomics.wait is what an agent is FOR; without this the
-     * engine throws "waiting is not allowed on this thread". */
-    JS_SetFutexCanWait(cx);
-    /* Interrupt callbacks are PER CONTEXT: without one here, js_close's
-     * urgent interrupt wakes an agent parked in Atomics.wait but nothing
-     * terminates it — the wait just resumes for its remaining timeout, and
-     * an infinite wait would make close hang forever. */
-    if (!JS_AddInterruptCallback(cx, interrupt_cb)) {
-        agent_milestone("interrupt callback FAILED");
-        JS_DestroyContext(cx);
-        return nullptr;
-    }
-    {
-        std::lock_guard<std::mutex> lock(rt->agents.mu);
-        rt->agents.contexts.push_back(cx);
-    }
-    if (!js::UseInternalJobQueues(cx) || !JS::InitSelfHostedCode(cx)) {
-        agent_milestone("selfhosted FAILED");
-        JS_DestroyContext(cx);
-        return nullptr;
-    }
+/* The agent's GC-thing scope. Every JS::Rooted and JSAutoRealm that
+ * references the agent's context lives INSIDE this function, so all of their
+ * destructors have run by the time the caller reaches JS_DestroyContext.
+ *
+ * That ordering is a hard correctness requirement, not style: ~Rooted pops
+ * itself by writing the previous list head back into the context
+ * (RootingContext::stackRoots_[kind]). Run after JS_DestroyContext has freed
+ * the context, that is a write into freed memory the allocator may have
+ * already handed to ANOTHER thread — observed in the wild as a report
+ * clone's tag word being zeroed (stackRoots_[RootKind::Object] sits at the
+ * same offset), i.e. the test262 "bad serialized structured data" flake. */
+static void agent_run(JSContext *cx, Runtime *rt, CtxData &ctxdata, AgentStart *start) {
     static JSClass agent_global_class = {"global", JSCLASS_GLOBAL_FLAGS,
                                         &JS::DefaultGlobalClassOps};
     JS::RealmOptions options;
@@ -1967,15 +1938,13 @@ static void *agent_thread_main(void *arg) {
         cx, JS_NewGlobalObject(cx, &agent_global_class, nullptr, JS::FireOnNewGlobalHook, options));
     if (!global) {
         agent_milestone("global FAILED");
-        JS_DestroyContext(cx);
-        return nullptr;
+        return;
     }
     {
         JSAutoRealm ar(cx, global);
         if (!JS::InitRealmStandardClasses(cx) || !install_agent_natives(cx, global)) {
             agent_milestone("realm FAILED");
-            JS_DestroyContext(cx);
-            return nullptr;
+            return;
         }
         /* Evaluate the adapter GLUE and the user SOURCE as SEPARATE scripts.
          * Concatenating them (the old prelude approach) silently broke the
@@ -2056,14 +2025,60 @@ static void *agent_thread_main(void *arg) {
         }
         JS_ClearPendingException(cx);
     }
-    {
-        std::lock_guard<std::mutex> lock(rt->agents.mu);
-        auto &v = rt->agents.contexts;
-        v.erase(std::remove(v.begin(), v.end(), cx), v.end());
+}
+
+static void *agent_thread_main(void *arg) {
+    std::unique_ptr<AgentStart> start(static_cast<AgentStart *>(arg));
+
+    Runtime *rt = start->rt;
+
+    /* This context's private data: its id for the reserved host calls and its
+     * print capture (which dies with it). */
+    CtxData ctxdata;
+    ctxdata.rt = rt;
+    ctxdata.agent_id = start->id;
+
+    /* Parented to the main runtime — same agent cluster, which is what makes
+     * the SharedArrayBuffer waiter list and the off-thread promise bookkeeping
+     * (both cluster-scoped) reach this agent. */
+    JSContext *cx = JS_NewContext(JS::DefaultHeapMaxBytes, rt->jsrt);
+    if (!cx) {
+        agent_milestone("JS_NewContext FAILED");
+    } else {
+        JS_SetContextPrivate(cx, &ctxdata);
+        /* Blocking in Atomics.wait is what an agent is FOR; without this the
+         * engine throws "waiting is not allowed on this thread". */
+        JS_SetFutexCanWait(cx);
+        /* Interrupt callbacks are PER CONTEXT: without one here, js_close's
+         * urgent interrupt wakes an agent parked in Atomics.wait but nothing
+         * terminates it — the wait just resumes for its remaining timeout, and
+         * an infinite wait would make close hang forever. */
+        if (!JS_AddInterruptCallback(cx, interrupt_cb)) {
+            agent_milestone("interrupt callback FAILED");
+        } else {
+            {
+                std::lock_guard<std::mutex> lock(rt->agents.mu);
+                rt->agents.contexts.push_back(cx);
+            }
+            if (!js::UseInternalJobQueues(cx) || !JS::InitSelfHostedCode(cx)) {
+                agent_milestone("selfhosted FAILED");
+            } else {
+                agent_run(cx, rt, ctxdata, start.get());
+            }
+            {
+                std::lock_guard<std::mutex> lock(rt->agents.mu);
+                auto &v = rt->agents.contexts;
+                v.erase(std::remove(v.begin(), v.end(), cx), v.end());
+            }
+        }
+        /* Only now — after every Rooted/AutoRealm destructor in agent_run has
+         * run — may the context be destroyed (see agent_run's comment). */
+        JS_DestroyContext(cx);
     }
-    JS_DestroyContext(cx);
     /* Tell the host this agent is gone (fire-and-forget; the host tracks
-     * lifecycle — its Alive count, releasing per-agent state). */
+     * lifecycle — its Alive count, releasing per-agent state). Runs on every
+     * path, including setup failures: the host allocated per-agent state at
+     * spawn and its Alive count must reach zero for js_close to return. */
     {
         char tag = 0;
         std::string payload;
@@ -2270,31 +2285,36 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
      * threads for them: non-blocking Atomics are ordinary operations, and a
      * blocking wait either throws or times out per [[CanBlock]]. */
     options.creationOptions().setSharedMemoryAndAtomicsEnabled(true);
-    JS::RootedObject global(
-        rt->cx, JS_NewGlobalObject(rt->cx, &global_class, nullptr, JS::FireOnNewGlobalHook, options));
-    if (!global) {
+    /* The Rooted and the AutoRealm must be destroyed BEFORE any
+     * JS_DestroyContext on the failure paths — a Rooted destructor writes the
+     * previous list head back through the context (see agent_run) — so the
+     * whole global+realm setup runs in its own scope and failure is signalled
+     * out instead of destroying the context mid-scope. */
+    bool realm_ok = false;
+    {
+        JS::RootedObject global(
+            rt->cx, JS_NewGlobalObject(rt->cx, &global_class, nullptr, JS::FireOnNewGlobalHook, options));
+        if (global) {
+            JSAutoRealm ar(rt->cx, global);
+            if (JS::InitRealmStandardClasses(rt->cx)) {
+                /* Inside the realm: handling an interrupt dereferences
+                 * cx->realm(). */
+                discover_interrupt_bits(rt->cx);
+                if (rt->bits_addr == nullptr) {
+                    /* Fallback: stay armed so the callback keeps being
+                     * invoked. The callback re-arms on every resume. */
+                    JS_RequestInterruptCallback(rt->cx);
+                }
+                rt->global = new JS::PersistentRootedObject(rt->cx, global);
+                realm_ok = true;
+            }
+        }
+    }
+    if (!realm_ok) {
         JS_DestroyContext(rt->cx);
         delete rt;
         return 0;
     }
-
-    {
-        JSAutoRealm ar(rt->cx, global);
-        if (!JS::InitRealmStandardClasses(rt->cx)) {
-            JS_DestroyContext(rt->cx);
-            delete rt;
-            return 0;
-        }
-        /* Inside the realm: handling an interrupt dereferences cx->realm(). */
-        discover_interrupt_bits(rt->cx);
-        if (rt->bits_addr == nullptr) {
-            /* Fallback: stay armed so the callback keeps being invoked. The
-             * callback re-arms on every resume. */
-            JS_RequestInterruptCallback(rt->cx);
-        }
-    }
-
-    rt->global = new JS::PersistentRootedObject(rt->cx, global);
     rt->interrupt = 0;
     /* The handle IS the runtime. */
     return reinterpret_cast<uint64_t>(rt);
