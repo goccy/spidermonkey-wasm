@@ -1286,14 +1286,38 @@ static JS::CloneDataPolicy shared_clone_policy() {
     return policy;
 }
 
-/* Serializes reads and frees: the host may hand ONE clone (a broadcast) to
- * several agents, whose reads would otherwise race on the buffer. */
+/* Serializes EVERY clone-buffer operation — write, read and free. Two
+ * distinct populations drive these concurrently: host-side ops
+ * (js_clone_write/read/free), which the Go embedder serializes against each
+ * other, and agent-thread ops (__clone_write__/__clone_read__ and the pump's
+ * inbox drain), which run inside wasm with no host lock at all. Reads and
+ * frees were always serialized (one broadcast clone is read by several
+ * agents); extending the mutex over writes closes the remaining unserialized
+ * mix — the structured-clone machinery shares SAB rawbuffer reference
+ * accounting across buffers, which nothing else orders between those two
+ * populations. */
 static std::mutex g_clone_mu;
 
-static uint64_t clone_handle_write(JSContext *cx, JS::HandleValue v) {
-    auto clone = std::make_unique<JSAutoStructuredCloneBuffer>(
-        JS::StructuredCloneScope::SameProcess, nullptr, nullptr);
-    if (!clone->write(cx, v, JS::UndefinedHandleValue, shared_clone_policy())) {
+/* scope MUST be DifferentProcess when the WRITER'S runtime may be torn down
+ * before the reader reads (an agent that reports a value and then leaves()):
+ * SameProcess encoding may keep live-GC-thing pointers (e.g. the JSString for
+ * a reported string) into the writer's heap, and once that agent's context is
+ * destroyed those pointers dangle. DifferentProcess fully serialises the
+ * value into the buffer, independent of the writer's heap and lifetime.
+ * Host->agent transfers (broadcast/send) stay SameProcess: the host runtime
+ * outlives every agent, and a SharedArrayBuffer must cross by reference (its
+ * backing is process-shared, not in any one runtime's heap) — which
+ * DifferentProcess forbids by design. */
+static uint64_t clone_handle_write(JSContext *cx, JS::HandleValue v,
+                                   JS::StructuredCloneScope scope) {
+    JS::CloneDataPolicy policy;
+    if (scope == JS::StructuredCloneScope::SameProcess) {
+        policy.allowSharedMemoryObjects();
+        policy.allowIntraClusterClonableSharedObjects();
+    }
+    std::lock_guard<std::mutex> lock(g_clone_mu);
+    auto clone = std::make_unique<JSAutoStructuredCloneBuffer>(scope, nullptr, nullptr);
+    if (!clone->write(cx, v, JS::UndefinedHandleValue, policy)) {
         return 0;
     }
     return reinterpret_cast<uint64_t>(clone.release());
@@ -1324,7 +1348,9 @@ uint64_t js_clone_write(uint64_t h, const char *val_p, uint32_t val_len) {
     }
     JS::RootedValue v(rt->cx);
     decode_js_value(rt->cx, encoded, &v);
-    uint64_t handle = clone_handle_write(rt->cx, v);
+    /* host->agent: the host runtime outlives every agent, and a broadcast may
+     * carry a SharedArrayBuffer that must cross by reference — SameProcess. */
+    uint64_t handle = clone_handle_write(rt->cx, v, JS::StructuredCloneScope::SameProcess);
     if (!handle) {
         JS_ClearPendingException(rt->cx);
     }
@@ -1817,10 +1843,19 @@ static bool agent_clone_read_native(JSContext *cx, unsigned argc, JS::Value *vp)
 }
 
 /* __clone_write__(v): structured-clone v on THIS thread; returns the clone
- * handle (the host takes ownership when the prelude posts it). */
+ * handle (the host takes ownership when the prelude posts it).
+ *
+ * DifferentProcess scope is REQUIRED here: this runs on an AGENT thread, and
+ * an agent typically posts a value and then leave()s, destroying its context.
+ * SameProcess encoding would embed live-GC-thing pointers into the agent's
+ * now-dead heap, which the host would later read as corrupted data (the
+ * classic "bad serialized structured data" flake). Full serialisation makes
+ * the buffer independent of this agent's lifetime. An agent that needs to
+ * post a SharedArrayBuffer by reference is not expressible this way, which is
+ * correct: a SAB reference into a dying runtime is exactly the bug. */
 static bool agent_clone_write_native(JSContext *cx, unsigned argc, JS::Value *vp) {
     JS::CallArgs args = JS::CallArgsFromVp(argc, vp);
-    uint64_t handle = clone_handle_write(cx, args.get(0));
+    uint64_t handle = clone_handle_write(cx, args.get(0), JS::StructuredCloneScope::DifferentProcess);
     if (!handle) {
         return false;
     }
