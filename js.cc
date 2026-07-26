@@ -92,7 +92,20 @@ struct ModuleEntry {
     JS::PersistentRootedObject *json = nullptr; /* ModuleType::JSON */
 };
 
+struct CtxData;
+
 #ifdef SPIDERMONKEY_WASM_THREADS
+/* A running agent, as the main thread sees it: its id (what the host names it
+ * by), its context (what an interrupt is requested on) and its per-context
+ * data (where the terminate flag lives). Registered when the agent's context
+ * is ready and removed before it is destroyed, both under AgentState::mu, so
+ * anything reached through this entry while holding the mutex is alive. */
+struct AgentCtx {
+    uint64_t id = 0;
+    JSContext *cx = nullptr;
+    CtxData *data = nullptr;
+};
+
 /* Agent lifecycle state (see the agents section). Communication policy lives
  * host-side; this is exactly what js_close's deterministic shutdown needs. */
 struct AgentState {
@@ -101,7 +114,7 @@ struct AgentState {
     std::atomic<uint32_t> alive{0}; /* running agent threads; futex-signaled on exit */
     std::atomic<uint64_t> next_id{1};
     std::vector<pthread_t> threads;
-    std::vector<JSContext *> contexts;
+    std::vector<AgentCtx> contexts;
 };
 #endif
 
@@ -116,6 +129,11 @@ struct CtxData {
 #ifdef SPIDERMONKEY_WASM_THREADS
     bool agent_left = false; /* __agent_leaving__() was called */
     uint64_t agent_id = 0;   /* 0 on the main context */
+    /* js_agent_interrupt asked this agent to stop. Written from ANOTHER thread
+     * (the host's) and read by this agent's interrupt callback and pump, hence
+     * atomic. It authorises the callback to terminate the agent's script
+     * uncatchably, exactly as rt->interrupt does for the main context. */
+    std::atomic<bool> agent_terminate{false};
 #endif
 };
 
@@ -148,6 +166,13 @@ struct Runtime {
      * The registry is the loader's per-runtime CACHE: sources arrive through
      * the reserved module-load host call and are compiled lazily per import. */
     std::map<std::string, ModuleEntry> *modules = nullptr;
+
+    /* Promises rejected with nothing to handle them, in rejection order, as
+     * the engine's rejection tracker reports them (see the unhandled-rejection
+     * section). Rooted because the host reads the rejection reason later, and
+     * an unreferenced rejected promise is otherwise collectable. Drained by
+     * js_take_unhandled_rejections. */
+    std::vector<JS::PersistentRootedObject *> unhandled;
 
 #ifdef SPIDERMONKEY_WASM_THREADS
     /* The runtime agents parent themselves to — same agent cluster, which is
@@ -204,7 +229,8 @@ static Runtime *rt_of(JSContext *cx) {
  * visible. It cannot spin forever unless something trips interruptBits_ and
  * never sets rt->interrupt, which nothing in this design does. */
 static bool interrupt_cb(JSContext *cx) {
-    Runtime *rt = rt_of(cx);
+    CtxData *d = ctx_data(cx);
+    Runtime *rt = d ? d->rt : nullptr;
     if (!rt || rt->discovering) {
         return true;
     }
@@ -216,6 +242,14 @@ static bool interrupt_cb(JSContext *cx) {
      * timeout. Terminate the agent script instead (uncatchable, like the
      * host interrupt). */
     if (rt->agents.shutdown.load(std::memory_order_seq_cst)) {
+        return false;
+    }
+    /* js_agent_interrupt targeted THIS agent (see js.h): terminate its script
+     * the same uncatchable way, so a guest stuck in a synchronous loop — which
+     * never reaches a job-queue drain and so never sees a cooperative
+     * sentinel — still stops. The flag stays set: the pump reads it after the
+     * unwind and leaves the agent for good. */
+    if (d->agent_terminate.load(std::memory_order_seq_cst)) {
         return false;
     }
 #endif
@@ -312,6 +346,45 @@ static void discover_interrupt_bits(JSContext *cx) {
 }
 
 #ifdef SPIDERMONKEY_WASM_THREADS
+/* ---- thread stacks ---------------------------------------------------------
+ *
+ * Every guest thread's stack is MALLOCED OUT OF LINEAR MEMORY, and linear
+ * memory is the instance's single hard budget (wasmify.json's MaxMemoryPages,
+ * the host's Config.MaxMemoryBytes). A thread created with a null attr takes
+ * wasi-libc's default stack size, which is the LINKED main-stack size — 8 MiB
+ * here (-Wl,-z,stack-size). Eight MiB is right for the main thread, which runs
+ * the deep C++ recursion of parsing and GC marking under an 8 MiB linker
+ * reservation; it is wildly wrong as a per-thread tax.
+ *
+ * Left at the default it caps the whole instance: 16 agents cost 128 MiB of
+ * stacks against a 256 MiB budget before a single JS object exists, and each
+ * concurrent helper task takes another 8 MiB exactly when GC needs them most
+ * (teardown). Past the budget pthread_create returns EAGAIN, which surfaces as
+ * "cannot spawn an agent" — or, for a helper task, as the inline fallback
+ * below running engine work on the wrong thread. Sizing these two explicitly
+ * is what makes the agent ceiling a function of what agents actually USE
+ * rather than of a linker flag meant for one thread.
+ *
+ * Both sizes are per-thread stacks for engine work, not for the main
+ * embedding: a helper task runs one bounded internal job (the size the engine
+ * is told about below), and an agent runs guest JS whose depth is bounded by
+ * its own recursion limit long before the stack runs out. */
+static const size_t kHelperThreadStackBytes = 512 * 1024;
+static const size_t kAgentThreadStackBytes = 1024 * 1024;
+
+/* Create a thread with an explicit stack size. Falls back to the default attr
+ * only if attr setup itself fails, which cannot happen for a valid size. */
+static int spawn_thread(pthread_t *tid, void *(*fn)(void *), void *arg, size_t stack_bytes) {
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) {
+        return pthread_create(tid, nullptr, fn, arg);
+    }
+    pthread_attr_setstacksize(&attr, stack_bytes);
+    int rc = pthread_create(tid, &attr, fn, arg);
+    pthread_attr_destroy(&attr);
+    return rc;
+}
+
 /* ---- helper-thread pool ----------------------------------------------------
  * A threads build hands internal tasks to an EXTERNAL pool and waits on them.
  * Each task runs on its own pthread — a goroutine under wasm2go. Registered
@@ -324,7 +397,11 @@ static void *helper_thread_trampoline(void *arg) {
 
 static void helper_thread_dispatch(JS::HelperThreadTask *task) {
     pthread_t tid;
-    if (pthread_create(&tid, nullptr, helper_thread_trampoline, task) != 0) {
+    /* The stack size the engine was TOLD these threads have (see js_new's
+     * SetHelperThreadTaskCallback). A null attr would silently give them the
+     * linked 8 MiB instead — 16x what the engine budgeted, times however many
+     * tasks run at once. */
+    if (spawn_thread(&tid, helper_thread_trampoline, task, kHelperThreadStackBytes) != 0) {
         JS::RunHelperThreadTask(task); /* inline: a dropped task deadlocks */
         return;
     }
@@ -1442,6 +1519,79 @@ std::string js_eval_module(uint64_t h, const char *specifier_p, uint32_t specifi
     return make_result(true, "undefined", "");
 }
 
+/* Classify a source as needing ES-module semantics or not, by COMPILING it —
+ * the question "is this an ES module?" answered by the parser that defines the
+ * answer, rather than by matching import/export against the source text (which
+ * misses a minified one-line bundle and fires on the word `export` inside a
+ * comment or a string).
+ *
+ * The rule is the one Node's own detection uses: a source is a module when it
+ * needs module syntax, i.e. it compiles as a module but NOT as CommonJS. Both
+ * compiles matter. Only the first would call every plain script a module,
+ * since almost every script is also a valid module; the pair isolates exactly
+ * the constructs that cannot appear anywhere else — a top-level `import` /
+ * `export` declaration, `import.meta`, top-level `await`.
+ *
+ * The CommonJS side is compiled the way CommonJS is actually evaluated, inside
+ * the module wrapper function, so the constructs that are legal only there
+ * (a top-level `return`) do not read as module syntax, and `await` at top
+ * level correctly does not parse.
+ *
+ * Returns the {ok,result,error} envelope with result "1" for a module and "0"
+ * otherwise. A source that compiles as NEITHER is broken; it reports "0" and
+ * the caller's real load surfaces the syntax error with its own file name and
+ * line numbers, which is where a user can act on it. Nothing is registered,
+ * evaluated or cached here — this only parses. */
+std::string js_source_is_module(uint64_t h, const char *src_p, uint32_t src_len) {
+    Runtime *rt = rt_from(h);
+    if (!rt || !rt->cx) {
+        return "{\"ok\":false,\"result\":\"\",\"error\":\"no runtime\"}";
+    }
+    std::string src(src_p ? src_p : "", src_p ? src_len : 0);
+    /* A `#!` line is legal at the START of a source in both dialects, and the
+     * CommonJS wrapper would move it off the start. Drop it from both sides so
+     * the two compiles see the same program. */
+    if (src.rfind("#!", 0) == 0) {
+        size_t nl = src.find('\n');
+        src.erase(0, nl == std::string::npos ? src.size() : nl);
+    }
+
+    JS::RootedObject global(rt->cx, rt->global->get());
+    JSAutoRealm ar(rt->cx, global);
+
+    auto compiles = [&](const std::string &code, bool as_module) -> bool {
+        JS::CompileOptions opts(rt->cx);
+        opts.setFileAndLine("<classify>", 1);
+        JS::SourceText<mozilla::Utf8Unit> buf;
+        if (!buf.init(rt->cx, code.data(), code.size(), JS::SourceOwnership::Borrowed)) {
+            JS_ClearPendingException(rt->cx);
+            return false;
+        }
+        bool ok;
+        if (as_module) {
+            JS::RootedObject module(rt->cx, JS::CompileModule(rt->cx, opts, buf));
+            ok = module != nullptr;
+        } else {
+            JS::RootedScript script(rt->cx, JS::Compile(rt->cx, opts, buf));
+            ok = script != nullptr;
+        }
+        /* A failed compile leaves a SyntaxError pending. It is an ANSWER here,
+         * not an error to propagate: clear it so the next compile — and the
+         * caller — start clean. */
+        JS_ClearPendingException(rt->cx);
+        return ok;
+    };
+
+    /* The CommonJS module wrapper, verbatim in shape: what makes a top-level
+     * `return` legal and top-level `await` illegal. */
+    std::string wrapped = "(function (exports, require, module, __filename, __dirname) {\n";
+    wrapped += src;
+    wrapped += "\n})";
+
+    bool is_module = compiles(src, true) && !compiles(wrapped, false);
+    return make_result(true, is_module ? "1" : "0", "");
+}
+
 /* ---- realm / engine primitives ---------------------------------------------
  * Generic JSAPI bindings a conformance harness (or any embedder) composes
  * host-side. Nothing test262-shaped lives in C++: $262 is assembled in Go
@@ -1645,6 +1795,87 @@ uint64_t js_new_htmldda(uint64_t h) {
     }
     JSAutoRealm ar(rt->cx, rt->global->get());
     return new_obj_handle(rt->cx, JS_NewObject(rt->cx, &is_htmldda_class));
+}
+
+/* ---- unhandled promise rejections ------------------------------------------
+ *
+ * A rejection nobody handles is only observable through an EMBEDDER callback:
+ * the engine calls the rejection tracker when a promise is rejected with no
+ * handler attached, and again when a handler shows up later. Nothing in guest
+ * JS can see it — an async function's promise is created by the engine, so
+ * wrapping the Promise constructor host-side misses exactly the cases that
+ * matter. Hence this is engine-side, and it is the whole of what
+ * `unhandledRejection` / `unhandledrejection` need.
+ *
+ * Policy stays host-side, as everywhere else here: the tracker only maintains
+ * the SET of still-unhandled rejections, and the host drains it whenever it
+ * decides a checkpoint has been reached (after a job drain — by then a
+ * same-tick `.catch()` has already retracted its promise through the Handled
+ * state, so nothing is reported that the guest went on to handle). */
+
+static void promise_rejection_tracker(JSContext *cx, bool mutedErrors,
+                                      JS::HandleObject promise,
+                                      JS::PromiseRejectionHandlingState state, void *data) {
+    (void)mutedErrors;
+    (void)data;
+    Runtime *rt = rt_of(cx);
+    if (!rt) {
+        return;
+    }
+    if (state == JS::PromiseRejectionHandlingState::Unhandled) {
+        rt->unhandled.push_back(new JS::PersistentRootedObject(cx, promise));
+        return;
+    }
+    /* Handled: a handler was attached after the fact, so this rejection is no
+     * longer unhandled and must not be reported. */
+    for (auto it = rt->unhandled.begin(); it != rt->unhandled.end(); ++it) {
+        if ((*it)->get() == promise) {
+            delete *it;
+            rt->unhandled.erase(it);
+            return;
+        }
+    }
+}
+
+/* Hand the host every rejection still unhandled and forget them — one
+ * checkpoint's worth. The result is a JSON array of
+ * {"reason":<encoding>,"promise":<encoding>}, in rejection order, which is
+ * the argument pair `unhandledRejection` is defined in terms of.
+ *
+ * Taking is destructive: a reported rejection is dropped here (its root
+ * released), so it is reported exactly once no matter how often the host
+ * checkpoints. */
+std::string js_take_unhandled_rejections(uint64_t h) {
+    Runtime *rt = rt_from(h);
+    if (!rt || !rt->cx) {
+        return "{\"ok\":false,\"result\":\"\",\"error\":\"no runtime\"}";
+    }
+    std::string arr = "[";
+    for (size_t i = 0; i < rt->unhandled.size(); i++) {
+        JS::RootedObject promise(rt->cx, rt->unhandled[i]->get());
+        /* The promise's OWN realm: a rejection can come from any realm this
+         * runtime made (js_new_realm), and encoding reads through it. */
+        JSAutoRealm ar(rt->cx, promise);
+        JS::RootedValue reason(rt->cx);
+        if (JS::GetPromiseState(promise) == JS::PromiseState::Rejected) {
+            reason.set(JS::GetPromiseResult(promise));
+        }
+        if (i) {
+            arr += ",";
+        }
+        arr += "{\"reason\":";
+        encode_js_value(rt->cx, reason, arr);
+        arr += ",\"promise\":";
+        JS::RootedValue pv(rt->cx, JS::ObjectValue(*promise));
+        encode_js_value(rt->cx, pv, arr);
+        arr += "}";
+    }
+    arr += "]";
+    for (JS::PersistentRootedObject *root : rt->unhandled) {
+        delete root;
+    }
+    rt->unhandled.clear();
+    return make_result(true, arr, "");
 }
 
 /* ---- agents (ECMA-262 agents; threads builds only) -------------------------
@@ -1979,6 +2210,7 @@ static void agent_run(JSContext *cx, Runtime *rt, CtxData &ctxdata, AgentStart *
                  *    broadcast, leaving and shutdown bump-and-notify the
                  *    futex. */
                 while (!ctxdata.agent_left &&
+                       !ctxdata.agent_terminate.load(std::memory_order_seq_cst) &&
                        !rt->agents.shutdown.load(std::memory_order_seq_cst)) {
                     /* Read the wake epoch BEFORE checking the inbox: a Send that
                      * arrives after the drain below but before the park bumps
@@ -1990,6 +2222,7 @@ static void agent_run(JSContext *cx, Runtime *rt, CtxData &ctxdata, AgentStart *
                     js::RunJobs(cx);
                     JS_ClearPendingException(cx);
                     if (ctxdata.agent_left ||
+                        ctxdata.agent_terminate.load(std::memory_order_seq_cst) ||
                         rt->agents.shutdown.load(std::memory_order_seq_cst)) {
                         break;
                     }
@@ -2005,9 +2238,11 @@ static void agent_run(JSContext *cx, Runtime *rt, CtxData &ctxdata, AgentStart *
                     }
                     agent_event_wait(seen, timeout_ns);
                 }
-            } else {
+            } else if (!ctxdata.agent_terminate.load(std::memory_order_seq_cst) &&
+                       !rt->agents.shutdown.load(std::memory_order_seq_cst)) {
                 /* Surface the pending exception's message — "evaluate FAILED"
-                 * alone names no cause. */
+                 * alone names no cause. A termination we asked for is not a
+                 * failure and carries no exception, so it is not reported. */
                 std::string msg = "evaluate FAILED: ";
                 JS::RootedValue exc(cx);
                 if (JS_GetPendingException(cx, &exc)) {
@@ -2046,6 +2281,13 @@ static void *agent_thread_main(void *arg) {
         agent_milestone("JS_NewContext FAILED");
     } else {
         JS_SetContextPrivate(cx, &ctxdata);
+        /* Bound native recursion INSIDE this agent's own stack (see
+         * kAgentThreadStackBytes) at the same half-of-stack ratio js_new uses
+         * for the main context. Without it the agent would inherit a quota
+         * sized for a stack it does not have, and deep recursion would
+         * overflow — a trap that takes down the whole instance — rather than
+         * raising a catchable "too much recursion". */
+        JS_SetNativeStackQuota(cx, kAgentThreadStackBytes / 2);
         /* Blocking in Atomics.wait is what an agent is FOR; without this the
          * engine throws "waiting is not allowed on this thread". */
         JS_SetFutexCanWait(cx);
@@ -2058,7 +2300,7 @@ static void *agent_thread_main(void *arg) {
         } else {
             {
                 std::lock_guard<std::mutex> lock(rt->agents.mu);
-                rt->agents.contexts.push_back(cx);
+                rt->agents.contexts.push_back(AgentCtx{start->id, cx, &ctxdata});
             }
             if (!js::UseInternalJobQueues(cx) || !JS::InitSelfHostedCode(cx)) {
                 agent_milestone("selfhosted FAILED");
@@ -2068,7 +2310,9 @@ static void *agent_thread_main(void *arg) {
             {
                 std::lock_guard<std::mutex> lock(rt->agents.mu);
                 auto &v = rt->agents.contexts;
-                v.erase(std::remove(v.begin(), v.end(), cx), v.end());
+                v.erase(std::remove_if(v.begin(), v.end(),
+                                       [cx](const AgentCtx &a) { return a.cx == cx; }),
+                        v.end());
             }
         }
         /* Only now — after every Rooted/AutoRealm destructor in agent_run has
@@ -2110,7 +2354,7 @@ uint64_t js_agent_spawn(uint64_t h, const char *glue_p, uint32_t glue_len, const
     /* Incremented BEFORE create: the agent may run to completion (and
      * decrement) before pthread_create even returns here. */
     rt->agents.alive.fetch_add(1, std::memory_order_seq_cst);
-    if (pthread_create(&tid, nullptr, agent_thread_main, start) != 0) {
+    if (spawn_thread(&tid, agent_thread_main, start, kAgentThreadStackBytes) != 0) {
         rt->agents.alive.fetch_sub(1, std::memory_order_seq_cst);
         delete start;
         return 0;
@@ -2133,6 +2377,53 @@ void js_agent_wake(uint64_t h) {
     agent_event_notify_all();
 }
 
+/* Host side: force one agent to stop, whatever it is doing.
+ *
+ * Cooperative termination (a sentinel the agent acts on between job-queue
+ * drains) cannot reach a guest that never drains — `while(true){}` is the
+ * whole point of this primitive. So do what js_close does to the WHOLE
+ * cluster, to one agent: raise its terminate flag (which authorises its
+ * interrupt callback to end the script uncatchably, so no guest `catch` can
+ * swallow it), then request an URGENT interrupt on its context. Urgent is
+ * what wakes an Atomics.wait already in progress; the flag is what survives
+ * the window where the interrupt lands between two waits, since the pump
+ * re-reads it after every drain and leaves for good.
+ *
+ * Asynchronous by design: it returns as soon as the agent is signalled, not
+ * when the agent is gone (the caller is on another thread and the agent may
+ * be mid-bytecode). The host learns of the exit through "\0agent-exit", as
+ * for any other agent shutdown. Returns 1 when an agent with this id was
+ * running and got signalled, 0 when it is unknown or already gone — in which
+ * case there is nothing to stop and the caller's goal already holds. */
+uint32_t js_agent_interrupt(uint64_t h, uint64_t agent_id) {
+    Runtime *rt = rt_from(h);
+    if (!rt || !rt->cx) {
+        return 0;
+    }
+    uint32_t found = 0;
+    {
+        /* The mutex is what makes reaching into another thread's CtxData safe:
+         * an agent's entry is registered once its context exists and removed
+         * before the context is destroyed, both under this lock. */
+        std::lock_guard<std::mutex> lock(rt->agents.mu);
+        for (const AgentCtx &a : rt->agents.contexts) {
+            if (a.id != agent_id) {
+                continue;
+            }
+            a.data->agent_terminate.store(true, std::memory_order_seq_cst);
+            JS_RequestInterruptCallback(a.cx);
+            found = 1;
+        }
+    }
+    /* Also release a pump parked on the event futex: it is not inside the
+     * engine, so no interrupt reaches it — the flag plus this wake is what
+     * makes an idle agent notice. */
+    if (found) {
+        agent_event_notify_all();
+    }
+    return found;
+}
+
 #else /* !SPIDERMONKEY_WASM_THREADS: single-agent build — spawn fails. */
 
 uint64_t js_agent_spawn(uint64_t h, const char *glue_p, uint32_t glue_len, const char *src_p,
@@ -2146,6 +2437,12 @@ uint64_t js_agent_spawn(uint64_t h, const char *glue_p, uint32_t glue_len, const
 }
 
 void js_agent_wake(uint64_t h) { (void)h; }
+
+uint32_t js_agent_interrupt(uint64_t h, uint64_t agent_id) {
+    (void)h;
+    (void)agent_id;
+    return 0;
+}
 
 #endif /* SPIDERMONKEY_WASM_THREADS */
 
@@ -2264,6 +2561,12 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
     }
 
     JS::SetWarningReporter(rt->cx, warning_reporter);
+
+    /* Unhandled rejections are reported to the embedder or to nobody (see the
+     * unhandled-rejection section). Main context only: an agent's rejections
+     * belong to that agent's global scope, and the agent's own adapter is
+     * what would surface them. */
+    JS::SetPromiseRejectionTrackerCallback(rt->cx, promise_rejection_tracker);
 
     /* Module loading is registry-backed (see js.h): the hook serves both
      * static imports and dynamic import() from what the host registered. */
@@ -2426,7 +2729,13 @@ void js_close(uint64_t h) {
         while (rt->agents.alive.load(std::memory_order_seq_cst) != 0) {
             {
                 std::lock_guard<std::mutex> lock(rt->agents.mu);
-                for (JSContext *acx : rt->agents.contexts) {
+                for (const AgentCtx &a : rt->agents.contexts) {
+                    /* Terminate as well as wake. shutdown alone already makes
+                     * the callback return false, but the flag keeps that true
+                     * for an agent that reaches a loop head after the shutdown
+                     * flag is cleared at the end of close. */
+                    a.data->agent_terminate.store(true, std::memory_order_seq_cst);
+                    JSContext *acx = a.cx;
                     /* URGENT, not CanWait: only CallbackUrgent takes the
                      * futex lock and wakes a wait in progress
                      * (JSContext::requestInterrupt); CallbackCanWait merely
@@ -2463,6 +2772,10 @@ void js_close(uint64_t h) {
     }
 #endif
     /* Persistent roots must be released while their runtime is still alive. */
+    for (JS::PersistentRootedObject *root : rt->unhandled) {
+        delete root;
+    }
+    rt->unhandled.clear();
     if (rt->modules) {
         for (auto &entry : *rt->modules) {
             delete entry.second.js;

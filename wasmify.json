@@ -84,6 +84,7 @@
       "js_eval",
       "js_agent_spawn",
       "js_agent_wake",
+      "js_agent_interrupt",
       "js_clone_write",
       "js_clone_read",
       "js_clone_free",
@@ -93,6 +94,8 @@
       "js_eval_in",
       "js_new_htmldda",
       "js_eval_module",
+      "js_source_is_module",
+      "js_take_unhandled_rejections",
       "js_global",
       "js_new_plain_object",
       "js_define_function",
@@ -140,7 +143,7 @@
   },
   "phases": {
     "gen-proto": {
-      "completed_at": "2026-07-21T06:45:06Z",
+      "completed_at": "2026-07-26T11:19:09Z",
       "upstream_commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
       "output_files": [
         "proto/spidermonkey.proto",
@@ -150,7 +153,7 @@
       ]
     },
     "parse-headers": {
-      "completed_at": "2026-07-21T06:45:05Z",
+      "completed_at": "2026-07-26T11:19:09Z",
       "upstream_commit": "5c671dd86db596ac2ea88a60bebf8d4505b4b8fa",
       "output_files": [
         "api-spec.json"

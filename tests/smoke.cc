@@ -72,6 +72,15 @@ static std::string js_eval(uint64_t h, const std::string &src) {
 static std::string js_eval_module(uint64_t h, const std::string &spec, const std::string &src) {
     return js_eval_module(h, spec.c_str(), (uint32_t)spec.size(), src.c_str(), (uint32_t)src.size());
 }
+static std::string js_source_is_module(uint64_t h, const std::string &src) {
+    return js_source_is_module(h, src.c_str(), (uint32_t)src.size());
+}
+
+/* js_source_is_module answers in the envelope's "result" field: "1" module,
+ * "0" not. */
+static bool is_module(uint64_t h, const std::string &src) {
+    return contains(js_source_is_module(h, src), "\"result\":\"1\"");
+}
 
 int main() {
     // When SPIDERMONKEY_WASM_NO_INTERRUPT_DISCOVERY is set, js.cc skips locating
@@ -316,6 +325,78 @@ int main() {
     check(contains(r, "out of memory") || contains(r, "allocation size overflow") ||
               (contains(r, "\"ok\":false") && contains(r, "memory")),
           "heap cap stops runaway allocation with an out-of-memory error");
+
+    // --- module classification ---------------------------------------------
+    // The pair of compiles has to separate "needs module semantics" from
+    // "happens to be valid as a module", which is nearly every script. The
+    // negative cases are the ones a source-text match gets wrong.
+    check(is_module(h, "import x from 'y'; x()"), "import declaration is a module");
+    check(is_module(h, "export const a = 1"), "export declaration is a module");
+    check(is_module(h, "export default 1"), "default export is a module");
+    check(is_module(h, "const u = import.meta.url"), "import.meta is a module");
+    check(is_module(h, "const r = await fetch('/x')"), "top-level await is a module");
+    check(is_module(h, ";export default 1;"), "a one-line bundle is still a module");
+    check(!is_module(h, "const a = 1; a + 1"), "a plain script is not a module");
+    check(!is_module(h, "module.exports = { a: 1 }"), "CommonJS exports is not a module");
+    check(!is_module(h, "if (x) return; module.exports = 1"),
+          "top-level return stays CommonJS, not a syntax error");
+    check(!is_module(h, "const p = import('./x.js')"), "dynamic import alone is not a module");
+    check(!is_module(h, "// export default 1\nmodule.exports = 1"),
+          "the word export inside a comment is not a module");
+    check(!is_module(h, "const s = 'export default 1'"),
+          "the word export inside a string is not a module");
+    check(!is_module(h, "#!/usr/bin/env node\nmodule.exports = 1"),
+          "a shebang does not make a CommonJS file a module");
+    check(is_module(h, "#!/usr/bin/env node\nexport default 1"),
+          "a shebang does not hide a module's export");
+    check(!is_module(h, "this ( is ) not = javascript ]["),
+          "an unparsable source reports not-a-module rather than failing");
+
+    // --- unhandled rejections ----------------------------------------------
+    // The engine reports these to the embedder or to nobody: an async
+    // function's promise is made by the engine, so a host-side Promise wrapper
+    // cannot see it. js_eval drains the job queue, so by the time it returns
+    // the tracker has settled.
+    r = js_take_unhandled_rejections(h);
+    check(contains(r, "\"result\":\"[]\""), "no rejections outstanding to start with");
+
+    // A primitive reason carries its data inline, so the assertion can read it
+    // straight out of the envelope.
+    js_eval(h, "Promise.reject('boom')");
+    r = js_take_unhandled_rejections(h);
+    std::printf("     %s\n", r.c_str());
+    check(contains(r, "\\\"v\\\":\\\"boom\\\""), "an unhandled rejection is reported with its reason");
+    check(contains(r, "\\\"promise\\\""), "the rejected promise is reported alongside the reason");
+
+    // An Error reason keeps its IDENTITY instead of being stringified: it
+    // crosses as an object handle, which is what lets a host handler hand the
+    // guest back the very Error it threw.
+    js_eval(h, "Promise.reject(new Error('boom'))");
+    r = js_take_unhandled_rejections(h);
+    std::printf("     %s\n", r.c_str());
+    check(contains(r, "\\\"reason\\\":{\\\"k\\\":\\\"object\\\""),
+          "an Error reason crosses as an object handle, not a stringification");
+
+    r = js_take_unhandled_rejections(h);
+    check(contains(r, "\"result\":\"[]\""), "taking a rejection reports it exactly once");
+
+    // A rejection the guest handles in the same tick must NOT be reported:
+    // the engine retracts it through the tracker's Handled state.
+    js_eval(h, "Promise.reject(new Error('caught')).catch(() => {})");
+    r = js_take_unhandled_rejections(h);
+    check(contains(r, "\"result\":\"[]\""), "a handled rejection is not reported");
+
+    // An async function's rejection is the case only the engine can see.
+    js_eval(h, "(async () => { throw 'async-boom' })()");
+    r = js_take_unhandled_rejections(h);
+    check(contains(r, "async-boom"), "an async function's rejection is reported");
+
+    // A handler attached in a LATER tick retracts a rejection that has not been
+    // reported yet.
+    js_eval(h, "globalThis.p = Promise.reject(new Error('late'))");
+    js_eval(h, "globalThis.p.catch(() => {})");
+    r = js_take_unhandled_rejections(h);
+    check(contains(r, "\"result\":\"[]\""), "a late handler retracts an unreported rejection");
 
     js_close(h);
     check(true, "js_close");

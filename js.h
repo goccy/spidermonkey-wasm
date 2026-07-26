@@ -98,6 +98,24 @@ std::string js_eval(uint64_t h, const char *src, uint32_t src_len);
  * produced by the drained jobs is captured exactly like js_eval's. */
 std::string js_run_jobs(uint64_t h);
 
+/* Hand back every promise rejection that is still unhandled, and forget them.
+ *
+ * A rejection with no handler is observable ONLY here: the engine reports it
+ * to the embedder, and guest JS cannot see it (an async function's promise is
+ * created by the engine, so wrapping the Promise constructor host-side misses
+ * exactly those). Anything shaped like `unhandledRejection` /
+ * `unhandledrejection` is composed host-side from this.
+ *
+ * Same JSON envelope as js_eval; "result" holds a JSON array of
+ * {"reason":<encoding>,"promise":<encoding>} in rejection order — the pair
+ * such an event is defined in terms of. Call it after a job drain
+ * (js_eval / js_run_jobs): by then a rejection the guest handled in the same
+ * tick has already retracted itself and is not reported.
+ *
+ * Draining is DESTRUCTIVE: each rejection is reported exactly once, however
+ * often this is called. */
+std::string js_take_unhandled_rejections(uint64_t h);
+
 /* ---- ES modules ------------------------------------------------------------
  *
  * Module loading is a LOADER CALLBACK: an import that misses the per-runtime
@@ -118,6 +136,27 @@ std::string js_run_jobs(uint64_t h);
  * compile/link/import/runtime failures. */
 std::string js_eval_module(uint64_t h, const char *specifier, uint32_t specifier_len,
                            const char *src, uint32_t src_len);
+
+/* Does `src` need ES-module semantics? Answered by the PARSER rather than by
+ * matching import/export against the source text — text matching misses a
+ * minified one-line bundle and fires on the word `export` inside a comment or
+ * a string literal, and the difference decides whether a file is loaded as a
+ * module or as CommonJS.
+ *
+ * The rule is Node's: a source is a module when it compiles as one but NOT as
+ * CommonJS. Both compiles are needed — nearly every plain script is also a
+ * valid module, so it is the CommonJS compile failing that isolates the
+ * constructs which can appear nowhere else (a top-level `import`/`export`
+ * declaration, `import.meta`, top-level `await`). The CommonJS side is
+ * compiled inside the module wrapper function, as CommonJS is really
+ * evaluated, so a top-level `return` stays legal there.
+ *
+ * Same JSON envelope as js_eval; "result" is "1" for a module and "0"
+ * otherwise. A source that compiles as NEITHER reports "0": it is broken, and
+ * the caller's real load then surfaces the syntax error against the file's own
+ * name and line numbers. Nothing is registered, evaluated or cached — this
+ * only parses. */
+std::string js_source_is_module(uint64_t h, const char *src, uint32_t src_len);
 
 /* ---- raw object-handle JSAPI bindings --------------------------------------
  * The internal (go-spidermonkey/internal) raw layer that a public embedding API
@@ -248,6 +287,25 @@ uint64_t js_agent_spawn(uint64_t h, const char *glue, uint32_t glue_len, const c
 /* Wake every agent pump parked on the event futex, so an agent whose inbox the
  * host just filled (Send) delivers promptly. Safe to call at any time. */
 void js_agent_wake(uint64_t h);
+
+/* Stop one agent, whatever it is doing — the FORCEFUL counterpart to the
+ * cooperative shutdown the host composes on top of the channels above.
+ *
+ * A cooperative stop (a sentinel the agent acts on between job-queue drains)
+ * cannot reach a guest that never drains: `new Worker('while(true){}')` never
+ * returns to its job queue, so it never reads the sentinel. This trips the
+ * agent's OWN context interrupt — the per-agent equivalent of the host
+ * interrupt described below — and its script ends with the same uncatchable
+ * exception, so guest JS cannot swallow it. An agent parked in Atomics.wait
+ * is woken; an idle agent parked on the event futex is released. After the
+ * script unwinds the agent leaves for good rather than resuming its pump.
+ *
+ * Asynchronous: it returns once the agent has been SIGNALLED, not once it is
+ * gone (the agent may be mid-bytecode on another thread). The exit arrives
+ * host-side as the usual "\0agent-exit". Returns 1 when an agent with this id
+ * was running and was signalled, 0 when the id is unknown or the agent has
+ * already exited — in which case there is nothing left to stop. */
+uint32_t js_agent_interrupt(uint64_t h, uint64_t agent_id);
 
 /* Clone the decoded value encoding on the MAIN thread into a clone handle
  * (0 = not clonable). The handle is owned by the caller: hand it to an agent
