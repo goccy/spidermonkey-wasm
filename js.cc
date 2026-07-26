@@ -66,6 +66,7 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -115,6 +116,20 @@ struct AgentState {
     std::atomic<uint64_t> next_id{1};
     std::vector<pthread_t> threads;
     std::vector<AgentCtx> contexts;
+    /* Every id that has been handed out and whose agent has not yet finished.
+     * An agent is in here from js_agent_spawn — BEFORE its thread has run —
+     * so an interrupt aimed at an agent still starting up can tell "not there
+     * yet" from "already gone". */
+    std::set<uint64_t> live;
+    /* Interrupts that arrived before their agent registered its context. The
+     * agent applies its own on registration; both happen under mu, so
+     * whichever order they occur in, the agent stops. */
+    std::set<uint64_t> pending_interrupt;
+    /* Threads that have run to completion and are waiting to be joined. A
+     * thread holds its whole stack until someone joins it, so leaving them all
+     * for js_close means every agent an instance ever spawned keeps its stack
+     * for the instance's life. */
+    std::vector<pthread_t> finished;
 };
 #endif
 
@@ -2194,7 +2209,13 @@ static void agent_run(JSContext *cx, Runtime *rt, CtxData &ctxdata, AgentStart *
             return JS::Evaluate(cx, opts, buf, &rval);
         };
         {
-            bool ok = eval_script(start->glue, "<agent-glue>") &&
+            /* Already asked to stop before the source ever ran (an interrupt
+             * that arrived while this thread was starting up): do not run it.
+             * The engine poll below would stop it anyway, but only once it
+             * reached a loop head — and source that throws or blocks before
+             * then would still have had its effect. */
+            bool ok = !ctxdata.agent_terminate.load(std::memory_order_seq_cst) &&
+                      eval_script(start->glue, "<agent-glue>") &&
                       eval_script(start->src, "<agent>");
             if (ok) {
                 /* The agent's work usually CONTINUES past evaluation (async
@@ -2301,6 +2322,20 @@ static void *agent_thread_main(void *arg) {
             {
                 std::lock_guard<std::mutex> lock(rt->agents.mu);
                 rt->agents.contexts.push_back(AgentCtx{start->id, cx, &ctxdata});
+                /* An interrupt may have arrived while this thread was still
+                 * starting up, when there was no context to request one on.
+                 * Registration and js_agent_interrupt both run under this
+                 * mutex, so exactly one of them sees the other's work and the
+                 * agent stops either way. */
+                if (rt->agents.pending_interrupt.erase(start->id)) {
+                    ctxdata.agent_terminate.store(true, std::memory_order_seq_cst);
+                    /* Arm the engine's poll as well. The flag only AUTHORISES
+                     * the interrupt callback to terminate; it does not cause
+                     * the callback to run. Without this the agent would go on
+                     * to evaluate its source and, if that source never
+                     * returns, never reach a point where the flag is read. */
+                    JS_RequestInterruptCallback(cx);
+                }
             }
             if (!js::UseInternalJobQueues(cx) || !JS::InitSelfHostedCode(cx)) {
                 agent_milestone("selfhosted FAILED");
@@ -2329,6 +2364,23 @@ static void *agent_thread_main(void *arg) {
         std::string callArgs = "[" + std::to_string(start->id) + "]";
         agent_host_call(kAgentExitKey, callArgs, &tag, &payload);
     }
+    /* Hand this thread over to be joined. A finished thread holds its entire
+     * stack until someone joins it, so without this every agent an instance
+     * ever spawned would keep its stack for the instance's lifetime — an
+     * instance that creates and retires workers over time would grow without
+     * bound even with only one alive at a time. Moving out of `threads` is
+     * what keeps js_close from joining the same thread twice. */
+    {
+        std::lock_guard<std::mutex> lock(rt->agents.mu);
+        pthread_t self = pthread_self();
+        auto &v = rt->agents.threads;
+        v.erase(std::remove_if(v.begin(), v.end(),
+                               [self](pthread_t t) { return pthread_equal(t, self) != 0; }),
+                v.end());
+        rt->agents.finished.push_back(self);
+        rt->agents.live.erase(start->id);
+        rt->agents.pending_interrupt.erase(start->id);
+    }
     /* Last: js_close's shutdown loop parks on the event futex until alive
      * hits zero; the notify is what releases it. */
     rt->agents.alive.fetch_sub(1, std::memory_order_seq_cst);
@@ -2340,15 +2392,41 @@ static void *agent_thread_main(void *arg) {
  * the user source; they are evaluated as SEPARATE scripts on the agent (so the
  * user source keeps its own strict directive, line numbers, and can even be a
  * module) — never concatenated. Returns the agent's id (0 on failure). */
+/* Join every agent thread that has finished, releasing its stack. Joining an
+ * already-exited thread returns at once, so this never blocks meaningfully;
+ * it is the counterpart to agent_thread_main handing itself over. */
+static void agent_reap_finished(Runtime *rt) {
+    std::vector<pthread_t> done;
+    {
+        std::lock_guard<std::mutex> lock(rt->agents.mu);
+        done.swap(rt->agents.finished);
+    }
+    for (pthread_t t : done) {
+        pthread_join(t, nullptr);
+    }
+}
+
 uint64_t js_agent_spawn(uint64_t h, const char *glue_p, uint32_t glue_len, const char *src_p,
                         uint32_t src_len) {
     Runtime *rt = rt_from(h);
     if (!rt || !rt->cx) {
         return 0;
     }
+    /* Retire the previous generation before allocating this one's stack, so a
+     * long-lived instance that churns through agents reuses their memory
+     * instead of accumulating it. */
+    agent_reap_finished(rt);
+
     uint64_t id = rt->agents.next_id.fetch_add(1, std::memory_order_relaxed);
     auto *start = new AgentStart{std::string(glue_p ? glue_p : "", glue_p ? glue_len : 0),
                                  std::string(src_p ? src_p : "", src_p ? src_len : 0), id, rt};
+
+    /* Live from HERE, before the thread exists: an interrupt aimed at this id
+     * in the meantime must be recorded rather than dismissed as unknown. */
+    {
+        std::lock_guard<std::mutex> lock(rt->agents.mu);
+        rt->agents.live.insert(id);
+    }
 
     pthread_t tid;
     /* Incremented BEFORE create: the agent may run to completion (and
@@ -2356,11 +2434,17 @@ uint64_t js_agent_spawn(uint64_t h, const char *glue_p, uint32_t glue_len, const
     rt->agents.alive.fetch_add(1, std::memory_order_seq_cst);
     if (spawn_thread(&tid, agent_thread_main, start, kAgentThreadStackBytes) != 0) {
         rt->agents.alive.fetch_sub(1, std::memory_order_seq_cst);
+        {
+            std::lock_guard<std::mutex> lock(rt->agents.mu);
+            rt->agents.live.erase(id);
+            rt->agents.pending_interrupt.erase(id);
+        }
         delete start;
         return 0;
     }
-    /* NOT detached: js_close joins every agent so none can outlive the
-     * runtime it shares an agent cluster with. */
+    /* NOT detached: the thread is joined either by the reaper above once it
+     * finishes, or by js_close, so none can outlive the runtime it shares an
+     * agent cluster with. */
     {
         std::lock_guard<std::mutex> lock(rt->agents.mu);
         rt->agents.threads.push_back(tid);
@@ -2412,6 +2496,16 @@ uint32_t js_agent_interrupt(uint64_t h, uint64_t agent_id) {
             }
             a.data->agent_terminate.store(true, std::memory_order_seq_cst);
             JS_RequestInterruptCallback(a.cx);
+            found = 1;
+        }
+        /* No context yet, but the agent exists: its thread is still building
+         * one. Leave the request for it to pick up at registration (which
+         * happens under this same mutex) — otherwise an interrupt issued
+         * immediately after spawn, which is exactly when a caller aborts a
+         * worker it just started, would be silently dropped and the agent
+         * would run forever. */
+        if (!found && rt->agents.live.count(agent_id)) {
+            rt->agents.pending_interrupt.insert(agent_id);
             found = 1;
         }
     }
@@ -2754,6 +2848,10 @@ void js_close(uint64_t h) {
             }
             agent_event_wait(seen, 50 * 1000 * 1000);
         }
+        /* Threads that retired on their own are waiting in `finished`; the
+         * rest are still in `threads`. Both have to be joined before the
+         * runtime goes away. */
+        agent_reap_finished(rt);
         std::vector<pthread_t> threads;
         {
             std::lock_guard<std::mutex> lock(rt->agents.mu);
@@ -2762,6 +2860,7 @@ void js_close(uint64_t h) {
         for (pthread_t t : threads) {
             pthread_join(t, nullptr);
         }
+        agent_reap_finished(rt);
         {
             std::lock_guard<std::mutex> lock(rt->agents.mu);
             rt->agents.threads.clear();
