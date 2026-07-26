@@ -28,6 +28,7 @@
  * embedding without its own event loop uses. */
 #include <jsfriendapi.h>
 
+#include <js/AllocPolicy.h>
 #include <js/Array.h>
 #include <js/ArrayBuffer.h>
 #include <js/experimental/TypedData.h>
@@ -92,6 +93,11 @@ struct ModuleEntry {
     JS::PersistentRootedObject *js = nullptr;   /* ModuleType::JavaScript */
     JS::PersistentRootedObject *json = nullptr; /* ModuleType::JSON */
 };
+
+/* The rejected promises the tracker is holding for the host. SystemAllocPolicy
+ * so the vector can be appended to from the tracker callback, which has no
+ * JSContext to hand a TempAllocPolicy. */
+using PromiseVector = JS::GCVector<JSObject *, 0, js::SystemAllocPolicy>;
 
 struct CtxData;
 
@@ -185,9 +191,16 @@ struct Runtime {
     /* Promises rejected with nothing to handle them, in rejection order, as
      * the engine's rejection tracker reports them (see the unhandled-rejection
      * section). Rooted because the host reads the rejection reason later, and
-     * an unreferenced rejected promise is otherwise collectable. Drained by
-     * js_take_unhandled_rejections. */
-    std::vector<JS::PersistentRootedObject *> unhandled;
+     * an unreferenced rejected promise is otherwise collectable.
+     *
+     * ONE root holding a GC vector, created up front — not a root per promise
+     * created inside the callback. The tracker also runs DURING GC (that is
+     * how a promise which became unreachable while still unhandled is
+     * reported), and registering a new persistent root from there mutates the
+     * runtime's root list mid-collection and roots a cell the GC may be
+     * sweeping. Appending to an already-traced vector is just a vector append.
+     * This is the shape SpiderMonkey's own shell uses. */
+    JS::PersistentRooted<PromiseVector> *unhandled = nullptr;
 
 #ifdef SPIDERMONKEY_WASM_THREADS
     /* The runtime agents parent themselves to — same agent cluster, which is
@@ -380,12 +393,24 @@ static void discover_interrupt_bits(JSContext *cx) {
  * is what makes the agent ceiling a function of what agents actually USE
  * rather than of a linker flag meant for one thread.
  *
- * Both sizes are per-thread stacks for engine work, not for the main
- * embedding: a helper task runs one bounded internal job (the size the engine
- * is told about below), and an agent runs guest JS whose depth is bounded by
- * its own recursion limit long before the stack runs out. */
-static const size_t kHelperThreadStackBytes = 512 * 1024;
-static const size_t kAgentThreadStackBytes = 1024 * 1024;
+ * Only AGENT threads are resized. An agent runs guest JS whose depth its own
+ * recursion limit bounds long before the stack does, it is created on demand
+ * by the guest, and there is one per live worker — so it is both safe to size
+ * and the one that decides the worker ceiling.
+ *
+ * SpiderMonkey's own helper threads are deliberately left at the default.
+ * They run engine internals (GC marking, off-thread parsing) whose real depth
+ * is not ours to predict, they are transient rather than one-per-worker, and
+ * wasm has no stack guard page: an overflow does not trap, it silently writes
+ * through whatever lies below and surfaces later as a wild-pointer fault
+ * somewhere unrelated. Shrinking them bought nothing here — they are a peak,
+ * not a per-worker tax — and risked exactly that. */
+/* 2 MiB: at js_new's own units-per-MiB this yields exactly upstream's default
+ * recursion ceiling, so an agent's guest recursion depth is unchanged from the
+ * engine's default while the stack under it is a quarter of the linked main
+ * stack. Crash-rate measurements across 1, 2 and 4 MiB were indistinguishable,
+ * so this is a budget choice, not a safety margin being spent. */
+static const size_t kAgentThreadStackBytes = 2 * 1024 * 1024;
 
 /* Create a thread with an explicit stack size. Falls back to the default attr
  * only if attr setup itself fails, which cannot happen for a valid size. */
@@ -412,11 +437,8 @@ static void *helper_thread_trampoline(void *arg) {
 
 static void helper_thread_dispatch(JS::HelperThreadTask *task) {
     pthread_t tid;
-    /* The stack size the engine was TOLD these threads have (see js_new's
-     * SetHelperThreadTaskCallback). A null attr would silently give them the
-     * linked 8 MiB instead — 16x what the engine budgeted, times however many
-     * tasks run at once. */
-    if (spawn_thread(&tid, helper_thread_trampoline, task, kHelperThreadStackBytes) != 0) {
+    /* Default stack size on purpose — see the thread-stacks section above. */
+    if (pthread_create(&tid, nullptr, helper_thread_trampoline, task) != 0) {
         JS::RunHelperThreadTask(task); /* inline: a dropped task deadlocks */
         return;
     }
@@ -1828,28 +1850,25 @@ uint64_t js_new_htmldda(uint64_t h) {
  * same-tick `.catch()` has already retracted its promise through the Handled
  * state, so nothing is reported that the guest went on to handle). */
 
+/* Runs on ordinary rejections AND during GC, for a promise that became
+ * unreachable while still unhandled. Nothing here may allocate a GC root or
+ * otherwise touch runtime-wide GC bookkeeping — see Runtime::unhandled. */
 static void promise_rejection_tracker(JSContext *cx, bool mutedErrors,
                                       JS::HandleObject promise,
                                       JS::PromiseRejectionHandlingState state, void *data) {
     (void)mutedErrors;
     (void)data;
     Runtime *rt = rt_of(cx);
-    if (!rt) {
+    if (!rt || !rt->unhandled) {
         return;
     }
     if (state == JS::PromiseRejectionHandlingState::Unhandled) {
-        rt->unhandled.push_back(new JS::PersistentRootedObject(cx, promise));
+        (void)rt->unhandled->append(promise.get()); /* OOM: drop the report */
         return;
     }
     /* Handled: a handler was attached after the fact, so this rejection is no
      * longer unhandled and must not be reported. */
-    for (auto it = rt->unhandled.begin(); it != rt->unhandled.end(); ++it) {
-        if ((*it)->get() == promise) {
-            delete *it;
-            rt->unhandled.erase(it);
-            return;
-        }
-    }
+    rt->unhandled->eraseIfEqual(promise.get());
 }
 
 /* Hand the host every rejection still unhandled and forget them — one
@@ -1865,9 +1884,20 @@ std::string js_take_unhandled_rejections(uint64_t h) {
     if (!rt || !rt->cx) {
         return "{\"ok\":false,\"result\":\"\",\"error\":\"no runtime\"}";
     }
+    if (!rt->unhandled) {
+        return make_result(true, "[]", "");
+    }
+    /* Take the batch out FIRST. Encoding allocates, allocation can collect,
+     * and a collection can call the tracker — which appends to (or erases
+     * from) this very vector. Iterating what nothing else can touch keeps that
+     * from reshaping the sequence mid-encode, and makes "reported exactly
+     * once" hold by construction. */
+    JS::Rooted<PromiseVector> batch(rt->cx, std::move(rt->unhandled->get()));
+    rt->unhandled->get().clear();
+
     std::string arr = "[";
-    for (size_t i = 0; i < rt->unhandled.size(); i++) {
-        JS::RootedObject promise(rt->cx, rt->unhandled[i]->get());
+    for (size_t i = 0; i < batch.get().length(); i++) {
+        JS::RootedObject promise(rt->cx, batch.get()[i]);
         /* The promise's OWN realm: a rejection can come from any realm this
          * runtime made (js_new_realm), and encoding reads through it. */
         JSAutoRealm ar(rt->cx, promise);
@@ -1886,10 +1916,6 @@ std::string js_take_unhandled_rejections(uint64_t h) {
         arr += "}";
     }
     arr += "]";
-    for (JS::PersistentRootedObject *root : rt->unhandled) {
-        delete root;
-    }
-    rt->unhandled.clear();
     return make_result(true, arr, "");
 }
 
@@ -1979,6 +2005,7 @@ static void agent_event_wait(uint32_t seen, int64_t timeout_ns) {
 static void agent_milestone(const char *what) {
     fprintf(stderr, "[agent] %s\n", what);
 }
+
 
 
 struct AgentStart {
@@ -2303,12 +2330,23 @@ static void *agent_thread_main(void *arg) {
     } else {
         JS_SetContextPrivate(cx, &ctxdata);
         /* Bound native recursion INSIDE this agent's own stack (see
-         * kAgentThreadStackBytes) at the same half-of-stack ratio js_new uses
-         * for the main context. Without it the agent would inherit a quota
-         * sized for a stack it does not have, and deep recursion would
-         * overflow — a trap that takes down the whole instance — rather than
-         * raising a catchable "too much recursion". */
+         * kAgentThreadStackBytes), at the same half-of-stack ratio js_new uses
+         * for the main context. Without it the agent would inherit a bound
+         * sized for a stack it does not have.
+         *
+         * On wasi the QUOTA alone is not the bound — recursion is counted by a
+         * depth counter, and its ceiling is what actually stops runaway
+         * recursion (see js_new). Leaving that ceiling at the engine default
+         * while shrinking the stack under it is how you get an overflow, and
+         * wasm has no guard page: it does not trap, it writes through whatever
+         * lies below and surfaces later as a wild-pointer fault somewhere else
+         * entirely. So scale BOTH, from this thread's real stack, at js_new's
+         * own units-per-MiB. */
         JS_SetNativeStackQuota(cx, kAgentThreadStackBytes / 2);
+#ifdef JS_HAS_MUTABLE_WASI_RECURSION_LIMIT
+        JS::RootingContext::get(cx)->wasiRecursionDepthLimit =
+            (uint32_t)((uint64_t)(kAgentThreadStackBytes / 2) * 350 / (1u << 20));
+#endif
         /* Blocking in Atomics.wait is what an agent is FOR; without this the
          * engine throws "waiting is not allowed on this thread". */
         JS_SetFutexCanWait(cx);
@@ -2421,33 +2459,42 @@ uint64_t js_agent_spawn(uint64_t h, const char *glue_p, uint32_t glue_len, const
     auto *start = new AgentStart{std::string(glue_p ? glue_p : "", glue_p ? glue_len : 0),
                                  std::string(src_p ? src_p : "", src_p ? src_len : 0), id, rt};
 
-    /* Live from HERE, before the thread exists: an interrupt aimed at this id
-     * in the meantime must be recorded rather than dismissed as unknown. */
-    {
-        std::lock_guard<std::mutex> lock(rt->agents.mu);
-        rt->agents.live.insert(id);
-    }
-
     pthread_t tid;
     /* Incremented BEFORE create: the agent may run to completion (and
      * decrement) before pthread_create even returns here. */
     rt->agents.alive.fetch_add(1, std::memory_order_seq_cst);
-    if (spawn_thread(&tid, agent_thread_main, start, kAgentThreadStackBytes) != 0) {
-        rt->agents.alive.fetch_sub(1, std::memory_order_seq_cst);
-        {
-            std::lock_guard<std::mutex> lock(rt->agents.mu);
+
+    bool created;
+    {
+        /* Creating the thread and recording it MUST be one critical section.
+         * An agent whose source finishes instantly reaches its own exit —
+         * which moves it from `threads` to `finished` under this same mutex —
+         * before pthread_create has even returned here. Recording the thread
+         * afterwards would then put it in `threads` AFTER it had already left,
+         * leaving it in BOTH lists and joined twice, which is undefined and in
+         * practice corrupts the allocator. Holding the mutex across the create
+         * makes the agent's own bookkeeping wait until this one is done, so
+         * every thread is in exactly one list.
+         *
+         * Live from here too, before the thread exists: an interrupt aimed at
+         * this id in the meantime must be recorded, not dismissed as unknown. */
+        std::lock_guard<std::mutex> lock(rt->agents.mu);
+        rt->agents.live.insert(id);
+        created = spawn_thread(&tid, agent_thread_main, start, kAgentThreadStackBytes) == 0;
+        if (created) {
+            /* NOT detached: the thread is joined either by the reaper once it
+             * finishes, or by js_close, so none can outlive the runtime it
+             * shares an agent cluster with. */
+            rt->agents.threads.push_back(tid);
+        } else {
             rt->agents.live.erase(id);
             rt->agents.pending_interrupt.erase(id);
         }
+    }
+    if (!created) {
+        rt->agents.alive.fetch_sub(1, std::memory_order_seq_cst);
         delete start;
         return 0;
-    }
-    /* NOT detached: the thread is joined either by the reaper above once it
-     * finishes, or by js_close, so none can outlive the runtime it shares an
-     * agent cluster with. */
-    {
-        std::lock_guard<std::mutex> lock(rt->agents.mu);
-        rt->agents.threads.push_back(tid);
     }
     return id;
 }
@@ -2659,7 +2706,11 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
     /* Unhandled rejections are reported to the embedder or to nobody (see the
      * unhandled-rejection section). Main context only: an agent's rejections
      * belong to that agent's global scope, and the agent's own adapter is
-     * what would surface them. */
+     * what would surface them.
+     *
+     * The vector is rooted BEFORE the tracker is registered — the callback can
+     * fire during a GC and must never have to create a root itself. */
+    rt->unhandled = new JS::PersistentRooted<PromiseVector>(rt->cx, PromiseVector());
     JS::SetPromiseRejectionTrackerCallback(rt->cx, promise_rejection_tracker);
 
     /* Module loading is registry-backed (see js.h): the hook serves both
@@ -2870,11 +2921,17 @@ void js_close(uint64_t h) {
         }
     }
 #endif
+    /* Stop the rejection tracker BEFORE anything else is released. Tearing a
+     * runtime down settles or discards promises, which can report a rejection
+     * — and the tracker's reaction is to root the promise. Left registered, it
+     * would create a PersistentRooted on a runtime that is being destroyed and
+     * push it into a vector this function is about to free, which is a
+     * use-after-free that surfaces as a fault inside JS_DestroyContext. */
+    JS::SetPromiseRejectionTrackerCallback(rt->cx, nullptr);
+
     /* Persistent roots must be released while their runtime is still alive. */
-    for (JS::PersistentRootedObject *root : rt->unhandled) {
-        delete root;
-    }
-    rt->unhandled.clear();
+    delete rt->unhandled;
+    rt->unhandled = nullptr;
     if (rt->modules) {
         for (auto &entry : *rt->modules) {
             delete entry.second.js;
