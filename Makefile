@@ -62,8 +62,9 @@ ENGINE_MEMORY   ?= 12g
 ENGINE_CPUS     ?= 8
 # `release` is what ships; SPIDERMONKEY_DEBUG=1 selects the assertion build.
 ENGINE_THREADS  ?= 1
+ENGINE_FLAVOR   ?= release
 
-.PHONY: all wasm wasm-clean tools deps engine engine-image bundle-gomod smoke help
+.PHONY: all wasm wasm-clean tools deps engine engine-build engine-install engine-image bundle-gomod smoke help
 
 # Install the tools wasmify.json declares (wasi-sdk, cargo). Safe to re-run;
 # already-installed tools are skipped.
@@ -83,10 +84,14 @@ tools:
 # have), and it rejects Apple's linker because `ld -Wl,--version` is an error
 # rather than a version string.
 #
-# Output lands in build/ ON THE HOST, because the repo is bind-mounted at
-# /src; the archive is then picked up by:
-#   SPIDERMONKEY_LOCAL_ARCHIVE=build/spidermonkey-static-intl-release.tar.gz make deps
+# Output lands in build/ ON THE HOST, because the repo is bind-mounted at /src,
+# and is then INSTALLED into deps/ — see engine-install for why that step is not
+# just `make deps`.
 engine: engine-image
+	@$(MAKE) engine-build
+	@$(MAKE) engine-install
+
+engine-build: engine-image
 	$(CONTAINER) run --rm \
 		-m $(ENGINE_MEMORY) -c $(ENGINE_CPUS) \
 		-v "$(CURDIR)":/src \
@@ -95,6 +100,19 @@ engine: engine-image
 		-e SPIDERMONKEY_THREADS=$(ENGINE_THREADS) \
 		$(if $(SPIDERMONKEY_DEBUG),-e SPIDERMONKEY_DEBUG=$(SPIDERMONKEY_DEBUG),) \
 		-w /src $(ENGINE_IMAGE) bash scripts/build-engine-intl.sh
+
+# Install the archive `engine` just built into deps/, where the wasm link picks
+# it up. This is NOT `make deps`: fetch-spidermonkey.sh short-circuits on a
+# .tag stamp that only records the SpiderMonkey TAG, so a freshly rebuilt
+# archive at the same tag is silently skipped — the build reports success and
+# the old engine stays installed. That is not hypothetical: two engine builds
+# in a row were measured against the previous binary before it was noticed.
+# Dropping the stamp is what makes the fetch actually re-extract.
+engine-install:
+	rm -f deps/spidermonkey/.tag
+	SPIDERMONKEY_LOCAL_ARCHIVE=build/spidermonkey-static-intl-$(ENGINE_FLAVOR).tar.gz \
+		bash scripts/fetch-spidermonkey.sh
+	@echo "==> installed $$(ls -la deps/spidermonkey/libspidermonkey.a | awk '{print $$6,$$7,$$8}')"
 
 # Build the engine build image if it is not present. Cheap to re-run: the
 # check is a listing, not a rebuild.
