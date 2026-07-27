@@ -192,6 +192,34 @@ grep -q 'side-effect-free description for objects' "$f" || {
     exit 1
 }
 
+# On __wasi__, MapAlignedPages serves every GC chunk with posix_memalign
+# followed by memset(region, 0, ChunkSize) — it zeroes the WHOLE 1 MiB chunk.
+# No other platform writes anything there: mmap hands back zero pages and they
+# fault in only as the GC actually uses them. On wasm the memset makes every
+# chunk fully resident the moment it is created, and linear memory can never be
+# returned, so it stays that way for the instance's life. Measured: a fresh
+# runtime allocates three chunks (tenured arenas, buffers, nursery), all three
+# 1024/1024 KiB resident, holding 164 KiB of live data — a worker costs ~3 MiB
+# of RAM for ~0.16 MiB of JavaScript.
+#
+# Only the chunk HEADER needs zeroing. ArenaChunkBase's mark bitmap and its
+# free/decommitted page bitmaps are never cleared explicitly and do rely on
+# zeroed memory; the arena bodies after FirstArenaOffset do not, since each
+# arena is initialized when it is handed out. Zeroing just the header takes the
+# write from 1 MiB to 16 KiB per chunk and leaves the rest untouched until it
+# is used.
+#
+# Scoped to exactly the chunk case (length == alignment == ChunkSize) so any
+# other caller keeps the previous fully-zeroed contract.
+f=$SRC/js/src/gc/Memory.cpp
+if ! grep -q 'spidermonkey-wasm] zero only the chunk header' "$f"; then
+    perl -0pi -e 's|  MOZ_ASSERT\(region != nullptr\);\n  memset\(region, 0, length\);\n  return region;|  MOZ_ASSERT(region != nullptr);\n  \/\/ [spidermonkey-wasm] zero only the chunk header. Zeroing the whole\n  \/\/ region makes every GC chunk fully resident for the life of the\n  \/\/ instance; the arena bodies are initialized when each arena is\n  \/\/ allocated, and only the header bitmaps rely on zeroed memory.\n  if (length == ChunkSize \&\& alignment == ChunkSize) {\n    memset(region, 0, FirstArenaOffset);\n  } else {\n    memset(region, 0, length);\n  }\n  return region;|' "$f"
+fi
+grep -q 'spidermonkey-wasm] zero only the chunk header' "$f" || {
+    echo "error: wasi chunk-header zeroing patch no longer applies to $f" >&2
+    exit 1
+}
+
 # --- threads patches (SPIDERMONKEY_THREADS=1) --------------------------------
 # WASI's threading in gecko is hard-wired OFF: js/src/moz.build picks
 # threading/noop/NoopThread.cpp and mozglue/misc/moz.build picks
