@@ -38,7 +38,7 @@ permissions:
 
 env:
   # Keep in lock-step with build.yml.
-  WASMIFY_VERSION: v0.5.2
+  WASMIFY_VERSION: v0.5.3
 
 jobs:
   # Build the with-Intl engine from source (ICU + Temporal + shared memory +

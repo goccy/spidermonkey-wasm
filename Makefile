@@ -41,12 +41,88 @@ WASMIFY_PIPELINE = \
 # `signal: killed` (no OOM: measured cgroup peak stays under the limit and
 # oom_kill stays 0). Zero means "no timeout", so the plugin runs to completion.
 
-.PHONY: all wasm wasm-clean tools deps bundle-gomod smoke help
+# The engine build runs in a Linux container; everything else runs on the host.
+# CONTAINER is Apple's `container` on macOS; set it to `docker` (or `podman`) to
+# use those instead — the flags below are common to all three.
+CONTAINER       ?= container
+ENGINE_IMAGE    ?= sm-engine-build
+# A named volume for BUILD_ROOT. It holds the ~5 GB gecko checkout and the
+# object dir, so keeping it turns a from-scratch engine build into an
+# incremental one (minutes, not tens of minutes). It also has to be a volume
+# rather than a bind mount from macOS: gecko does not build on a
+# case-insensitive filesystem (it has both string.h and String.h), so the tree
+# must live on the container's own filesystem.
+ENGINE_VOLUME   ?= sm-engine-work
+# The ThinLTO link of libjs_static peaks at several GB. The container default
+# is 1 GB, which does NOT fail — it thrashes: measured 240 minutes of linker
+# CPU and 5.4 TB of block I/O with no progress and no error, which reads
+# exactly like a hang. Give it real memory, and enough cores for the parallel
+# LTO backend.
+ENGINE_MEMORY   ?= 12g
+ENGINE_CPUS     ?= 8
+# `release` is what ships; SPIDERMONKEY_DEBUG=1 selects the assertion build.
+ENGINE_THREADS  ?= 1
+ENGINE_FLAVOR   ?= release
+
+.PHONY: all wasm wasm-clean tools deps engine engine-build engine-install engine-image bundle-gomod smoke help
 
 # Install the tools wasmify.json declares (wasi-sdk, cargo). Safe to re-run;
 # already-installed tools are skipped.
 tools:
 	wasmify ensure-tools . --output-dir .
+
+# Build the SpiderMonkey engine itself — the ONLY step that needs a container,
+# and the only way to change SpiderMonkey's own C++ (see the source patches in
+# scripts/build-engine-intl.sh). `make wasm` does NOT need this: it links the
+# prebuilt archive that already sits in deps/, so touching js.cc alone never
+# requires an engine build.
+#
+# Why a container. gecko's mach supports only Linux and Windows hosts for a
+# wasi cross-build. On macOS it fails during host detection, before configure
+# gets anywhere near the target: it cannot parse any SDKSettings.plist (its
+# Python needs a working pyexpat, which a Homebrew python routinely does not
+# have), and it rejects Apple's linker because `ld -Wl,--version` is an error
+# rather than a version string.
+#
+# Output lands in build/ ON THE HOST, because the repo is bind-mounted at /src,
+# and is then INSTALLED into deps/ — see engine-install for why that step is not
+# just `make deps`.
+engine: engine-image
+	@$(MAKE) engine-build
+	@$(MAKE) engine-install
+
+engine-build: engine-image
+	$(CONTAINER) run --rm \
+		-m $(ENGINE_MEMORY) -c $(ENGINE_CPUS) \
+		-v "$(CURDIR)":/src \
+		--mount type=volume,source=$(ENGINE_VOLUME),target=/work \
+		-e BUILD_ROOT=/work \
+		-e SPIDERMONKEY_THREADS=$(ENGINE_THREADS) \
+		$(if $(SPIDERMONKEY_DEBUG),-e SPIDERMONKEY_DEBUG=$(SPIDERMONKEY_DEBUG),) \
+		-w /src $(ENGINE_IMAGE) bash scripts/build-engine-intl.sh
+
+# Install the archive `engine` just built into deps/, where the wasm link picks
+# it up. This is NOT `make deps`: fetch-spidermonkey.sh short-circuits on a
+# .tag stamp that only records the SpiderMonkey TAG, so a freshly rebuilt
+# archive at the same tag is silently skipped — the build reports success and
+# the old engine stays installed. That is not hypothetical: two engine builds
+# in a row were measured against the previous binary before it was noticed.
+# Dropping the stamp is what makes the fetch actually re-extract.
+engine-install:
+	rm -f deps/spidermonkey/.tag
+	SPIDERMONKEY_LOCAL_ARCHIVE=build/spidermonkey-static-intl-$(ENGINE_FLAVOR).tar.gz \
+		bash scripts/fetch-spidermonkey.sh
+	@echo "==> installed $$(ls -la deps/spidermonkey/libspidermonkey.a | awk '{print $$6,$$7,$$8}')"
+
+# Build the engine build image if it is not present. Cheap to re-run: the
+# check is a listing, not a rebuild.
+engine-image:
+	@if ! $(CONTAINER) image list 2>/dev/null | awk '{print $$1}' | grep -qx '$(ENGINE_IMAGE)'; then \
+		echo "==> building $(ENGINE_IMAGE) from Dockerfile.engine"; \
+		$(CONTAINER) build -t $(ENGINE_IMAGE) -f Dockerfile.engine .; \
+	else \
+		echo "==> $(ENGINE_IMAGE) present"; \
+	fi
 
 # Materialise the two link inputs, neither of which is committed:
 #   deps/spidermonkey/   the prebuilt engine archive + headers (~520 MB)
@@ -107,6 +183,8 @@ help:
 	@echo 'Targets:'
 	@echo '  wasm         Fetch deps, link spidermonkey.wasm, emit the wasm2go bundle'
 	@echo '  deps         Fetch the prebuilt engine + build the Rust staticlib'
+	@echo '  engine       Build SpiderMonkey itself in a container (only needed'
+	@echo '               to change SpiderMonkey C++; make wasm does not use it)'
 	@echo '  tools        Install wasi-sdk and the tools wasmify.json declares'
 	@echo '  smoke        Run tests/smoke.cc under wasmtime, in both interrupt modes'
 	@echo '  bundle-gomod Stamp go.mod into the wasm2go bundle'
