@@ -1790,6 +1790,10 @@ uint64_t js_new_realm(uint64_t h) {
             JS_ClearPendingException(rt->cx);
             return 0;
         }
+        /* Same shape as the main realm (see js_new). */
+        if (!JS_InitReflectParse(rt->cx, newGlobal)) {
+            JS_ClearPendingException(rt->cx);
+        }
     }
     return new_obj_handle(rt->cx, newGlobal);
 }
@@ -2797,6 +2801,16 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
         if (global) {
             JSAutoRealm ar(rt->cx, global);
             if (JS::InitRealmStandardClasses(rt->cx)) {
+                /* Reflect.parse: the engine's own parser, exposed so a host
+                 * can ask STRUCTURAL questions about a source instead of
+                 * matching its text. The compat layer needs exactly one —
+                 * "which names would this CommonJS module put on exports?" —
+                 * and answering it with regular expressions misreads strings,
+                 * comments and anything the patterns did not anticipate.
+                 * Failure is not fatal: the realm is usable without it. */
+                if (!JS_InitReflectParse(rt->cx, global)) {
+                    JS_ClearPendingException(rt->cx);
+                }
                 /* Inside the realm: handling an interrupt dereferences
                  * cx->realm(). */
                 discover_interrupt_bits(rt->cx);
