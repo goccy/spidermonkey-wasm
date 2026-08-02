@@ -1496,6 +1496,29 @@ void js_clone_free(uint64_t clone_handle) {
     }
 }
 
+/* An evaluated module's exports, as a handle the host can read like any other
+ * object. This is what makes require() of an ES module possible: the caller is
+ * a host function running re-entrantly on the guest's own stack, and what it
+ * owes its caller is the namespace, not a status. The handle is released the
+ * usual way (js_release_value); a module whose namespace cannot be produced
+ * still evaluated, so that is reported as success with no handle rather than
+ * as a failure. */
+static std::string module_result_with_namespace(JSContext *cx, JS::HandleObject module) {
+    JS::RootedObject ns(cx, JS::GetModuleNamespace(cx, module));
+    if (!ns) {
+        JS_ClearPendingException(cx);
+        return make_result(true, "undefined", "");
+    }
+    uint64_t handle = new_obj_handle(cx, ns);
+    std::string j = "{\"ok\":true,";
+    j += json_field("result", "undefined", true);
+    j += json_field("error", "", true);
+    j += "\"namespace\":";
+    j += std::to_string(handle);
+    j += "}";
+    return j;
+}
+
 std::string js_eval_module(uint64_t h, const char *specifier_p, uint32_t specifier_len,
                            const char *src_p, uint32_t src_len) {
     const std::string specifier(specifier_p ? specifier_p : "", specifier_p ? specifier_len : 0);
@@ -1540,7 +1563,7 @@ std::string js_eval_module(uint64_t h, const char *specifier_p, uint32_t specifi
         if (JS::IsPromiseObject(promise)) {
             switch (JS::GetPromiseState(promise)) {
             case JS::PromiseState::Fulfilled:
-                return make_result(true, "undefined", "");
+                return module_result_with_namespace(rt->cx, module);
             case JS::PromiseState::Rejected: {
                 JS::RootedValue reason(rt->cx, JS::GetPromiseResult(promise));
                 JS_SetPendingException(rt->cx, reason);
@@ -1553,7 +1576,7 @@ std::string js_eval_module(uint64_t h, const char *specifier_p, uint32_t specifi
             }
         }
     }
-    return make_result(true, "undefined", "");
+    return module_result_with_namespace(rt->cx, module);
 }
 
 /* Classify a source as needing ES-module semantics or not, by COMPILING it —
