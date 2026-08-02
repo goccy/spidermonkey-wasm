@@ -781,12 +781,19 @@ static JSObject *compile_and_register_module(JSContext *cx, const std::string &s
  * exception when the loader reported an error. Unlike host_func_call the reply
  * carries the raw source, not JSON — the source is bytes, not a value. */
 static bool call_go_module_loader(JSContext *cx, const std::string &specifier,
-                                  const std::string &referrer, std::string &out_source) {
+                                  const std::string &referrer, const char *module_type,
+                                  std::string &out_source) {
     static const std::string key("\0module-load", 12);
+    /* The import's declared TYPE travels as a third argument: the loader
+     * otherwise cannot tell `import x from "./a.json"` from the same import
+     * with `with { type: "json" }`, and so cannot report the missing
+     * attribute. A host that reads only the first two sees no change. */
     std::string args = "[\"";
     json_escape(specifier, args);
     args += "\",\"";
     json_escape(referrer, args);
+    args += "\",\"";
+    json_escape(module_type ? module_type : "js", args);
     args += "\"]";
 
     std::vector<char> out(4096);
@@ -841,7 +848,12 @@ static JSObject *lookup_module(JSContext *cx, JS::HandleObject moduleRequest,
         }
     }
     std::string source;
-    if (call_go_module_loader(cx, resolved, ref, source)) {
+    /* JS::ModuleType is what the import ASKED for: Unknown when no attribute
+     * was written, JSON when `with { type: "json" }` was. */
+    const char *type_name = type == JS::ModuleType::JSON ? "json"
+                            : type == JS::ModuleType::JavaScript ? "js"
+                                                                 : "unknown";
+    if (call_go_module_loader(cx, resolved, ref, type_name, source)) {
         register_module_source(rt, resolved, source);
         return compile_module_entry(cx, resolved, (*rt->modules)[resolved], type);
     }
@@ -2096,13 +2108,30 @@ static bool agent_call_native(JSContext *cx, unsigned argc, JS::Value *vp) {
     }
     std::string key("\0", 1);
     key += op;
+    /* The arguments after the channel travel as JSON: a NUMBER stays a number
+     * (a clone handle, a millisecond count — what the existing channels take)
+     * and a STRING travels as a string. Coercing everything to a number, as
+     * this did, meant no agent host call could carry a name or a payload, so
+     * an agent could not reach the generic host-function table at all. */
     std::string callArgs = "[" + std::to_string(ctx_data(cx)->agent_id);
-    if (args.hasDefined(1)) {
+    for (unsigned i = 1; i < args.length(); i++) {
+        if (!args.hasDefined(i)) {
+            continue;
+        }
+        callArgs += ",";
+        if (args.get(i).isString()) {
+            JS::RootedString argStr(cx, args.get(i).toString());
+            std::string utf8 = jsstring_to_utf8(cx, argStr);
+            callArgs += "\"";
+            json_escape(utf8, callArgs);
+            callArgs += "\"";
+            continue;
+        }
         double extra = 0;
-        if (!JS::ToNumber(cx, args.get(1), &extra)) {
+        if (!JS::ToNumber(cx, args.get(i), &extra)) {
             return false;
         }
-        callArgs += "," + std::to_string((uint64_t)extra);
+        callArgs += std::to_string((uint64_t)extra);
     }
     callArgs += "]";
     char tag = 0;
