@@ -781,12 +781,19 @@ static JSObject *compile_and_register_module(JSContext *cx, const std::string &s
  * exception when the loader reported an error. Unlike host_func_call the reply
  * carries the raw source, not JSON — the source is bytes, not a value. */
 static bool call_go_module_loader(JSContext *cx, const std::string &specifier,
-                                  const std::string &referrer, std::string &out_source) {
+                                  const std::string &referrer, const char *module_type,
+                                  std::string &out_source) {
     static const std::string key("\0module-load", 12);
+    /* The import's declared TYPE travels as a third argument: the loader
+     * otherwise cannot tell `import x from "./a.json"` from the same import
+     * with `with { type: "json" }`, and so cannot report the missing
+     * attribute. A host that reads only the first two sees no change. */
     std::string args = "[\"";
     json_escape(specifier, args);
     args += "\",\"";
     json_escape(referrer, args);
+    args += "\",\"";
+    json_escape(module_type ? module_type : "js", args);
     args += "\"]";
 
     std::vector<char> out(4096);
@@ -841,7 +848,12 @@ static JSObject *lookup_module(JSContext *cx, JS::HandleObject moduleRequest,
         }
     }
     std::string source;
-    if (call_go_module_loader(cx, resolved, ref, source)) {
+    /* JS::ModuleType is what the import ASKED for: Unknown when no attribute
+     * was written, JSON when `with { type: "json" }` was. */
+    const char *type_name = type == JS::ModuleType::JSON ? "json"
+                            : type == JS::ModuleType::JavaScript ? "js"
+                                                                 : "unknown";
+    if (call_go_module_loader(cx, resolved, ref, type_name, source)) {
         register_module_source(rt, resolved, source);
         return compile_module_entry(cx, resolved, (*rt->modules)[resolved], type);
     }
@@ -1496,6 +1508,29 @@ void js_clone_free(uint64_t clone_handle) {
     }
 }
 
+/* An evaluated module's exports, as a handle the host can read like any other
+ * object. This is what makes require() of an ES module possible: the caller is
+ * a host function running re-entrantly on the guest's own stack, and what it
+ * owes its caller is the namespace, not a status. The handle is released the
+ * usual way (js_release_value); a module whose namespace cannot be produced
+ * still evaluated, so that is reported as success with no handle rather than
+ * as a failure. */
+static std::string module_result_with_namespace(JSContext *cx, JS::HandleObject module) {
+    JS::RootedObject ns(cx, JS::GetModuleNamespace(cx, module));
+    if (!ns) {
+        JS_ClearPendingException(cx);
+        return make_result(true, "undefined", "");
+    }
+    uint64_t handle = new_obj_handle(cx, ns);
+    std::string j = "{\"ok\":true,";
+    j += json_field("result", "undefined", true);
+    j += json_field("error", "", true);
+    j += "\"namespace\":";
+    j += std::to_string(handle);
+    j += "}";
+    return j;
+}
+
 std::string js_eval_module(uint64_t h, const char *specifier_p, uint32_t specifier_len,
                            const char *src_p, uint32_t src_len) {
     const std::string specifier(specifier_p ? specifier_p : "", specifier_p ? specifier_len : 0);
@@ -1540,7 +1575,7 @@ std::string js_eval_module(uint64_t h, const char *specifier_p, uint32_t specifi
         if (JS::IsPromiseObject(promise)) {
             switch (JS::GetPromiseState(promise)) {
             case JS::PromiseState::Fulfilled:
-                return make_result(true, "undefined", "");
+                return module_result_with_namespace(rt->cx, module);
             case JS::PromiseState::Rejected: {
                 JS::RootedValue reason(rt->cx, JS::GetPromiseResult(promise));
                 JS_SetPendingException(rt->cx, reason);
@@ -1553,7 +1588,7 @@ std::string js_eval_module(uint64_t h, const char *specifier_p, uint32_t specifi
             }
         }
     }
-    return make_result(true, "undefined", "");
+    return module_result_with_namespace(rt->cx, module);
 }
 
 /* Classify a source as needing ES-module semantics or not, by COMPILING it —
@@ -1754,6 +1789,10 @@ uint64_t js_new_realm(uint64_t h) {
         if (!JS::InitRealmStandardClasses(rt->cx)) {
             JS_ClearPendingException(rt->cx);
             return 0;
+        }
+        /* Same shape as the main realm (see js_new). */
+        if (!JS_InitReflectParse(rt->cx, newGlobal)) {
+            JS_ClearPendingException(rt->cx);
         }
     }
     return new_obj_handle(rt->cx, newGlobal);
@@ -2073,13 +2112,30 @@ static bool agent_call_native(JSContext *cx, unsigned argc, JS::Value *vp) {
     }
     std::string key("\0", 1);
     key += op;
+    /* The arguments after the channel travel as JSON: a NUMBER stays a number
+     * (a clone handle, a millisecond count — what the existing channels take)
+     * and a STRING travels as a string. Coercing everything to a number, as
+     * this did, meant no agent host call could carry a name or a payload, so
+     * an agent could not reach the generic host-function table at all. */
     std::string callArgs = "[" + std::to_string(ctx_data(cx)->agent_id);
-    if (args.hasDefined(1)) {
+    for (unsigned i = 1; i < args.length(); i++) {
+        if (!args.hasDefined(i)) {
+            continue;
+        }
+        callArgs += ",";
+        if (args.get(i).isString()) {
+            JS::RootedString argStr(cx, args.get(i).toString());
+            std::string utf8 = jsstring_to_utf8(cx, argStr);
+            callArgs += "\"";
+            json_escape(utf8, callArgs);
+            callArgs += "\"";
+            continue;
+        }
         double extra = 0;
-        if (!JS::ToNumber(cx, args.get(1), &extra)) {
+        if (!JS::ToNumber(cx, args.get(i), &extra)) {
             return false;
         }
-        callArgs += "," + std::to_string((uint64_t)extra);
+        callArgs += std::to_string((uint64_t)extra);
     }
     callArgs += "]";
     char tag = 0;
@@ -2745,6 +2801,16 @@ uint64_t js_new(uint32_t max_heap_bytes, uint32_t native_stack_quota_bytes) {
         if (global) {
             JSAutoRealm ar(rt->cx, global);
             if (JS::InitRealmStandardClasses(rt->cx)) {
+                /* Reflect.parse: the engine's own parser, exposed so a host
+                 * can ask STRUCTURAL questions about a source instead of
+                 * matching its text. The compat layer needs exactly one —
+                 * "which names would this CommonJS module put on exports?" —
+                 * and answering it with regular expressions misreads strings,
+                 * comments and anything the patterns did not anticipate.
+                 * Failure is not fatal: the realm is usable without it. */
+                if (!JS_InitReflectParse(rt->cx, global)) {
+                    JS_ClearPendingException(rt->cx);
+                }
                 /* Inside the realm: handling an interrupt dereferences
                  * cx->realm(). */
                 discover_interrupt_bits(rt->cx);
